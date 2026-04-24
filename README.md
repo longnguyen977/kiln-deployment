@@ -17,6 +17,7 @@ in `deploy/<env>.env`.
 - [Daily workflow](#daily-workflow)
 - [Rollback](#rollback)
 - [Operations](#operations)
+- [Migrations](#migrations)
 - [How it works](#how-it-works)
 - [Updating a submodule](#updating-a-submodule)
 - [Troubleshooting](#troubleshooting)
@@ -73,10 +74,12 @@ in `deploy/<env>.env`.
 ```
 kiln-deployment/                  ← this repo
 ├── deploy.sh                     ← deploy tool (build / deploy / rollback)
+├── migration.sh                  ← goose migration runner (schema changes)
 ├── docker-compose.yml            ← real compose, uses ${VAR} substitution
 ├── docker/
 │   ├── backend.dockerfile        ← multi-stage Go build
-│   └── frontend.dockerfile       ← multi-stage Next.js build
+│   ├── frontend.dockerfile       ← multi-stage Next.js build
+│   └── migration.dockerfile      ← goose + psql, ~15 MB
 ├── deploy/
 │   ├── dev.env                   ← state: VERSION_*, API_URL, paths (committed)
 │   └── prod.env
@@ -180,15 +183,15 @@ sudo -u postgres psql
 # the docker bridge subnet (e.g. 172.17.0.0/16).
 ```
 
-### 5. Run migrations (manual, one-time)
+### 5. Run migrations (via `migration.sh`)
 
 ```bash
-cd backend
-goose -dir db/migrations postgres "$GOOSE_DBSTRING" up
-# or load the monolithic schema:
-# psql "$DATABASE_URL" < ../sql/database.sql
-cd ..
+./migration.sh up -e prod
 ```
+
+Builds a small goose-only container (first run only) and applies every
+pending migration against the DB in `env/.env.prod`. See
+[Migrations](#migrations) below for the full command reference.
 
 ### 6. First deploy
 
@@ -307,11 +310,82 @@ docker exec -it kiln-frontend-service sh
 
 ### DB migrations after a schema change
 
-Migrations are not auto-run. After bumping versions, run from the host:
+Migrations are not auto-run by `deploy.sh`. See [Migrations](#migrations)
+for the full workflow — the one-liner is:
 
 ```bash
-cd backend
-goose -dir db/migrations postgres "$GOOSE_DBSTRING" up
+./migration.sh up -e prod
+```
+
+---
+
+## Migrations
+
+Schema changes are handled by `./migration.sh`, a thin wrapper around
+[goose](https://github.com/pressly/goose) that runs inside a 15 MB
+ephemeral container (`docker/migration.dockerfile`). Deliberately
+separate from `deploy.sh` so routine app deploys can't accidentally
+touch schema.
+
+### How it's wired
+
+- The container holds only the `goose` binary + `psql` client (no Go
+  toolchain, no Next.js, no backend code).
+- `backend/db/migrations/` is **bind-mounted** at runtime — no image
+  rebuild needed when you add migrations.
+- `DATABASE_URL` / `GOOSE_DBSTRING` come from `env/.env.<env>`, the
+  same file the backend container uses. **Single source of truth for
+  DB connection**, no drift between app and migration configs.
+- The container talks to host-level Postgres via
+  `host.docker.internal` (wired by `--add-host host-gateway`).
+
+### Common commands
+
+```bash
+./migration.sh up       -e prod           # apply all pending
+./migration.sh status   -e prod           # show applied + pending
+./migration.sh version  -e prod           # current schema version
+./migration.sh down     -e prod           # roll back one
+./migration.sh redo     -e prod           # roll back + re-apply last
+./migration.sh up-to    20260501000000 -e prod    # partial upgrade
+./migration.sh down-to  20260414000010 -e prod    # partial rollback
+./migration.sh validate -e prod           # lint migrations, don't run
+```
+
+### Creating a new migration
+
+```bash
+./migration.sh create add_email_index -e dev
+# writes backend/db/migrations/<timestamp>_add_email_index.sql
+```
+
+Edit the generated SQL, commit to the **backend** submodule, push,
+then `./migration.sh up -e prod` on the deploy host.
+
+### Interactive shell (goose + psql)
+
+For ad-hoc DB inspection:
+
+```bash
+./migration.sh shell -e prod
+# inside the container:
+#   goose status
+#   psql "$DATABASE_URL"
+```
+
+### Reset (destructive)
+
+`./migration.sh reset -e prod` rolls back every migration. It will
+**prompt for confirmation** — type the env name to proceed. Do not
+script this.
+
+### Upgrading goose
+
+Edit `ARG GOOSE_VERSION=...` at the top of
+`docker/migration.dockerfile`, then:
+
+```bash
+./migration.sh build
 ```
 
 ---
@@ -433,7 +507,9 @@ git submodule update --init --recursive
 
 ---
 
-## Deploy command reference
+## Command reference
+
+### `deploy.sh` — build + ship app code
 
 ```
 ./deploy.sh up        -e <env> -v <version>    Build + deploy both services
@@ -444,4 +520,23 @@ git submodule update --init --recursive
 ./deploy.sh status    -e <env>                 Show running versions + ps
 ./deploy.sh logs      -e <env> [service]       Tail logs (backend|frontend|all)
 ./deploy.sh help                               Show help
+```
+
+### `migration.sh` — schema changes
+
+```
+./migration.sh up                 -e <env>     Apply all pending migrations
+./migration.sh up-by-one          -e <env>     Apply next single pending migration
+./migration.sh up-to   <version>  -e <env>     Apply up to specific version
+./migration.sh down               -e <env>     Roll back one migration
+./migration.sh down-to <version>  -e <env>     Roll back to specific version
+./migration.sh redo               -e <env>     Roll back + re-apply last
+./migration.sh reset              -e <env>     Roll back ALL  (confirmed, destructive)
+./migration.sh status             -e <env>     Show applied + pending
+./migration.sh version            -e <env>     Current schema version
+./migration.sh validate           -e <env>     Validate without applying
+./migration.sh create  <name>     -e <env>     New migration SQL file
+./migration.sh shell              -e <env>     Interactive shell (goose + psql)
+./migration.sh build                           Rebuild migration image
+./migration.sh help                            Show help
 ```
