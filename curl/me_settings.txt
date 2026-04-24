@@ -1,0 +1,108 @@
+# Me — Settings (per-user, per-org preferences)
+#
+#   GET   /api/v1/me/settings          — current settings for the active org
+#   PATCH /api/v1/me/settings          — partial update; missing keys untouched
+#
+# Scope: the (user_id, organization_id) pair from the JWT. Switching orgs
+# via /me/organizations/:id/switch changes which row is read/written — a
+# user can have different preferences per org (which is the point of
+# per-user-per-org storage).
+#
+# No row is created until the first PATCH. Until then, GET returns schema
+# defaults so the UI always has a concrete shape to bind to.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /api/v1/me/settings
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s http://localhost:8080/api/v1/me/settings \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# First call (no row yet) → schema defaults:
+# {
+#   "auto_send_interview_email":       false,
+#   "notify_ai_review_done":           true,
+#   "notify_ai_score_done":            true,
+#   "notify_cv_import_done":           true,
+#   "notify_jd_confirmed":             true,
+#   "email_alert_interview_upcoming":  false,
+#   "email_alert_offer_due":           false
+# }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATCH /api/v1/me/settings
+# Partial update — only keys present in the body are changed. Response is
+# the full resolved settings (same shape as GET).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Turn on auto-send + mute one notification:
+curl -s -X PATCH http://localhost:8080/api/v1/me/settings \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auto_send_interview_email": true,
+    "notify_jd_confirmed":       false
+  }' | jq .
+
+# Response (other keys preserved from their previous values):
+# {
+#   "auto_send_interview_email":       true,   ← changed
+#   "notify_ai_review_done":           true,
+#   "notify_ai_score_done":            true,
+#   "notify_cv_import_done":           true,
+#   "notify_jd_confirmed":             false,  ← changed
+#   "email_alert_interview_upcoming":  false,
+#   "email_alert_offer_due":           false
+# }
+
+# Empty body is a valid no-op (returns current values):
+curl -s -X PATCH http://localhost:8080/api/v1/me/settings \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq .
+
+# ── Settings catalogue ────────────────────────────────────────────────────────
+# Category 1 — Automatic email send
+#   auto_send_interview_email         Default FALSE — opt-in. When TRUE the
+#                                     /interviews/:id/send_email flow fires
+#                                     automatically at scheduled_at instead
+#                                     of waiting for HR to click send.
+#
+# Category 2 — In-app notifications (task done events)
+#   notify_ai_review_done             Default TRUE
+#   notify_ai_score_done              Default TRUE
+#   notify_cv_import_done             Default TRUE
+#   notify_jd_confirmed               Default TRUE
+#
+# Category 3 — Email alerts (outbound reminders to the user)
+#   email_alert_interview_upcoming    Default FALSE — opt-in
+#   email_alert_offer_due             Default FALSE — opt-in
+#
+# Rule of thumb: in-app notifications default ON (cheap to show); outbound
+# emails default OFF (they land in a real inbox).
+
+# ── Switching orgs changes which row applies ─────────────────────────────────
+# 1. Grab a second org from /me/organizations
+# 2. Switch into it:
+#      curl -s -X POST \
+#        "http://localhost:8080/api/v1/me/organizations/<other-org-id>/switch" \
+#        -H "Authorization: Bearer $TOKEN"
+#    Save the fresh access_token from the response.
+# 3. GET /me/settings now returns THAT org's row (or defaults if the user
+#    has never patched settings there).
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/me/settings | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ── Error: malformed JSON body ────────────────────────────────────────────────
+curl -s -X PATCH http://localhost:8080/api/v1/me/settings \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d 'not-json' | jq .
+# → 400 { "error": { "code": "INVALID_BODY", "message": "invalid request body" } }

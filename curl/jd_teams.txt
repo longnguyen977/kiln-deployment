@@ -1,0 +1,82 @@
+# Pools API
+# GET /api/v1/jd/teams                  — list all pools across all departments
+# GET /api/v1/jd/departments/:id/teams  — list pools within a specific department
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/jd/departments — list departments first ───────────────────────
+curl -s http://localhost:8080/api/v1/jd/departments \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── GET /api/v1/jd/teams — all pools (no department filter needed) ────────────
+curl -s http://localhost:8080/api/v1/jd/teams \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": [
+#     { "id": "uuid", "name": "Backend Engineer",  "department": "Engineering" },
+#     { "id": "uuid", "name": "Frontend Engineer", "department": "Engineering" },
+#     { "id": "uuid", "name": "2D Artist",         "department": "Design" },
+#     { "id": "uuid", "name": "UI/UX Design",      "department": "Design" }
+#   ],
+#   "total": 4
+# }
+
+# ── GET /api/v1/jd/departments/:id/teams — pools within one department ────────
+DEPT_ID="paste-department-uuid-here"
+curl -s "http://localhost:8080/api/v1/jd/departments/$DEPT_ID/teams" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": [
+#     { "id": "uuid", "name": "Backend Engineer" },
+#     { "id": "uuid", "name": "Frontend Engineer" }
+#   ],
+#   "total": 2
+# }
+
+# ── GET /api/v1/jd/requisitions?team_id=<uuid> — filter by pool ───────────────
+TEAM_ID="paste-pool-uuid-here"
+curl -s "http://localhost:8080/api/v1/jd/requisitions?team_id=$TEAM_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": [
+#     {
+#       "id":          "uuid",
+#       "role_title":  "BACK-END DEVELOPER (GOLANG)",
+#       "department":  "Engineering",
+#       "team":        "Backend Engineer",
+#       "date_posted": "2026-04-15",
+#       "applicants":  3,
+#       "status":      "open"
+#     }
+#   ],
+#   "total": 1
+# }
+
+# ── Filter by both department and pool ────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/requisitions?department_id=$DEPT_ID&team_id=$TEAM_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Error: invalid department id ─────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/departments/not-a-uuid/pools" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_ID", ... } }
+
+# ── Error: invalid pool_id filter ─────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/requisitions?team_id=not-a-uuid" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_TEAM_ID", ... } }
+
+# ── Pools are auto-created when confirming a JD with a team field ─────────────
+# The AI extracts "team" from the JD text (e.g. "Backend Engineer", "UI/UX Design").
+# On /confirm the backend upserts: department → pool → job_position.
+# So pools populate automatically — no manual creation needed.

@@ -1,0 +1,24 @@
+# Google OAuth flow
+# Requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET set in env/.env
+# (or credentials/google_oauth.json filled in).
+#
+# Full browser flow:
+#   1. Frontend button → GET /api/v1/auth/google  (backend sets oauth_state cookie, redirects to Google)
+#   2. User consents on Google
+#   3. Google → GET /api/v1/auth/google/callback?code=...&state=...
+#   4. Backend exchanges code for tokens, issues JWT, then:
+#      → 307 redirect to http://localhost:3000/auth/callback?access_token=...&refresh_token=...&expires_in=900
+#   5. Frontend reads params from the URL and stores the tokens
+
+# ── Step 1: check the redirect URL ────────────────────────────────────────────
+curl -s -o /dev/null -w "%{redirect_url}\n" \
+  http://localhost:8080/api/v1/auth/google
+
+# ── On successful callback the browser lands at ───────────────────────────────
+# http://localhost:3000/auth/callback
+#   ?access_token=eyJ...
+#   &refresh_token=abcdef...
+#   &expires_in=900
+
+# ── Not configured → 503 ──────────────────────────────────────────────────────
+# { "error": { "code": "GOOGLE_NOT_CONFIGURED", "message": "Google OAuth is not configured" } }

@@ -1,0 +1,32 @@
+# Departments API — GET /api/v1/jd/departments
+# Returns all active departments for the authenticated organization.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/jd/departments ────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/jd/departments \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": [
+#     { "id": "uuid", "name": "Engineering" },
+#     { "id": "uuid", "name": "Product" }
+#   ],
+#   "total": 2
+# }
+
+# ── Use department_id to filter requisitions ──────────────────────────────────
+DEPT_ID=$(curl -s http://localhost:8080/api/v1/jd/departments \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.data[0].id')
+
+curl -s "http://localhost:8080/api/v1/jd/requisitions?department_id=$DEPT_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/jd/departments | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

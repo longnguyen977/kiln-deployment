@@ -1,0 +1,145 @@
+# Interviews — Automatic candidate notifications (background worker)
+#
+# When a user sets auto_send_interview_email = TRUE on /me/settings, the
+# background worker sends up to three AI-drafted emails per interview:
+#
+#   reminder  — ~15 min before scheduled_at
+#   start     — at scheduled_at
+#   end       — after scheduled_at + duration_minutes
+#
+# Each email is a separate row in interview_sent_emails (kind column). The
+# worker's NOT EXISTS guard ensures idempotency across the 5-minute polling
+# ticks — one send per (interview, kind) pair, regardless of how many
+# times the worker sweeps.
+#
+# PREREQUISITES:
+#   1. user_settings.auto_send_interview_email = TRUE for the interview
+#      creator (see PATCH /api/v1/me/settings below).
+#   2. org_source_integrations row for 'gmail' exists and holds a valid
+#      refresh token — the worker sends as the creator's Gmail account.
+#      Reconnect via /api/v1/integrations/gmail/connect when tokens die.
+#   3. candidates.canonical_email is populated — the query filters out
+#      candidates with no email on file.
+#   4. GoogleAIAPIKey set in config — the worker skips sends otherwise.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Turn auto-send on
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+curl -s -X PATCH http://localhost:8080/api/v1/me/settings \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"auto_send_interview_email": true}' | jq .
+
+# Response is the full resolved settings object — confirms the flag flipped.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# How the worker ticks
+# ══════════════════════════════════════════════════════════════════════════════
+# Every 5 minutes (startup + cron) the worker calls:
+#
+#   ListPendingAutoSendInterviews — returns (interview, kind) rows where:
+#     • interview.status = 'scheduled'  (+ 'completed' for end)
+#     • user_settings.auto_send_interview_email = TRUE for creator
+#     • candidate has a canonical_email
+#     • the time window for that kind is open right now
+#     • no prior interview_sent_emails row of that kind exists
+#
+# For each returned row:
+#   1. Gemini generates a kind-specific subject + body (language = candidate's
+#      CV language).
+#   2. gmail.SendEmail posts the message via the creator's connected Gmail.
+#   3. A new interview_sent_emails row is inserted with kind = "reminder"
+#      / "start" / "end", so the next tick skips it.
+#
+# Windows used by the worker:
+#
+#   reminder : scheduled_at - 15min ≤ NOW() < scheduled_at
+#   start    : scheduled_at ≤ NOW() < scheduled_at + 15min
+#   end      : scheduled_at + duration ≤ NOW() < scheduled_at + duration + 2h
+#
+# The 2h upper bound on "end" prevents the worker from back-filling ancient
+# interviews if the feature is turned on long after the fact.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# What the emails look like
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# reminder
+#   Subject:  Reminder: interview in ~15 minutes
+#   Body:     "Hi Vũ, your interview for Unity Developer at Acme starts in
+#              about 15 minutes. Join via the link below:
+#              Google Meet — <link>
+#              See you in a few!"
+#
+# start
+#   Subject:  Your interview is starting now
+#   Body:     "Hi Vũ, it's time for your interview. Please join now:
+#              Google Meet — <link>"
+#
+# end
+#   Subject:  Thanks for the interview — quick feedback?
+#   Body:     "Hi Vũ, thanks for taking the time to speak with us today
+#              about the Unity Developer role at Acme.
+#              Would you be willing to share a few lines on how the
+#              conversation went — what went well, anything we could
+#              improve? Just reply to this email. We'll be in touch
+#              about next steps soon."
+#
+# (Language switches to Vietnamese when cv_extractions.extracted_data->>'language' = 'vi'.)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Verifying it worked
+# ══════════════════════════════════════════════════════════════════════════════
+
+INTERVIEW_ID="<uuid from POST /api/v1/interviews>"
+
+# /info shows the MANUAL send under email_draft.last_send if HR clicked /send_email.
+# Auto-sent notifications are in interview_sent_emails but aren't surfaced on
+# /info today — to inspect them, query directly:
+#
+#   SELECT kind, sent_at, gmail_message_id, subject
+#   FROM interview_sent_emails
+#   WHERE interview_id = '<uuid>'
+#   ORDER BY sent_at;
+#
+# API logs under logger "worker.interview_autosend" show:
+#   • "pending auto-sends count=<N>" per tick
+#   • "auto-sent interview notification interview_id=<uuid> kind=<...>" per success
+#   • "auto-send failed" warn on any Gemini / Gmail / DB failure
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Turn auto-send off
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X PATCH http://localhost:8080/api/v1/me/settings \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"auto_send_interview_email": false}' | jq .
+
+# The very next tick stops selecting interviews created by this user. Any
+# in-flight goroutine still finishes (they've already loaded their row); no
+# new sends start.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Notes & limitations
+# ══════════════════════════════════════════════════════════════════════════════
+# - The 5-min tick interval is coarser than the 15-min trigger windows, so
+#   sends can be up to ~5 min late. Fine for human-scale notifications;
+#   cut the interval in worker/interview_autosend.go if you need tighter.
+# - Dead Gmail refresh token → per-interview "auto-send failed" log; the
+#   worker does NOT pause the whole org. User gets to reconnect without
+#   blocking other interviews belonging to OTHER creators with healthy tokens.
+# - Multi-instance deploys: the NOT EXISTS query + UNIQUE row writes protect
+#   against double-send from the DB side (insert will collide on an advisory
+#   lock-like race). For bullet-proof exactly-once, wrap the tick in
+#   pg_advisory_xact_lock.
+# - If HR manually sent an email earlier (kind='manual'), it does NOT block
+#   the auto-sent reminder/start/end — manual and scheduled are tracked
+#   under separate kinds. Adjust the NOT EXISTS in
+#   db/queries/interviews.sql if you want manual sends to suppress the
+#   auto reminder.

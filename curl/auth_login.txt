@@ -1,0 +1,107 @@
+# POST /api/v1/auth/login
+# Login with email and password.
+# Returns access_token, refresh_token, and user info on success.
+
+curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "password": "supersecret"
+  }' | jq .
+
+# ── Expected: 200 OK ───────────────────────────────────────────────────────────
+# {
+#   "data": {
+#     "access_token": "eyJ...",
+#     "refresh_token": "abcdef...",
+#     "token_type": "Bearer",
+#     "expires_in": 900,
+#     "user": { ... }
+#   }
+# }
+
+# ── Wrong password → 401 ──────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "password": "wrongpassword"
+  }' | jq .
+
+# ── Unknown email → 401 ───────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "nobody@nowhere.com",
+    "password": "somepassword"
+  }' | jq .
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Two-step login when TOTP is enabled
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# If the user has turned on 2FA via /me/totp/setup + /me/totp/verify, the
+# FIRST response to /auth/login does NOT include access / refresh tokens.
+# Instead it carries a short-lived challenge token (5 min) the client trades
+# for real tokens by POSTing /auth/login/totp.
+#
+# Same machinery is used for Google OAuth — the callback redirects to
+# ${FRONTEND_URL}/auth/callback?mfa_required=1&challenge_token=...&expires_in=300
+# instead of the normal tokens-in-query-string redirect.
+
+# ── Step 1: email + password (TOTP-enabled account) ───────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "password": "supersecret"
+  }' | jq .
+
+# Response (200 OK, password accepted but tokens withheld):
+# {
+#   "data": {
+#     "mfa_required":    true,
+#     "challenge_token": "eyJhbGci...",
+#     "expires_in":      300
+#   }
+# }
+
+# ── Step 2: POST /api/v1/auth/login/totp with the 6-digit code ────────────────
+CHALLENGE="eyJhbGci..."
+curl -s -X POST http://localhost:8080/api/v1/auth/login/totp \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"challenge_token\": \"$CHALLENGE\",
+    \"code\":            \"123456\"
+  }" | jq .
+
+# Response (200 OK) — same shape as a normal login:
+# {
+#   "data": {
+#     "access_token":  "eyJ...",
+#     "refresh_token": "abcdef...",
+#     "token_type":    "Bearer",
+#     "expires_in":    900,
+#     "user":          { ... }
+#   }
+# }
+
+# Errors from /auth/login/totp:
+# → 400 INVALID_BODY        — malformed JSON
+# → 400 MISSING_CHALLENGE   — challenge_token empty
+# → 400 INVALID_CODE        — code wasn't 6 digits after trim
+# → 401 INVALID_CHALLENGE   — challenge expired / tampered / TOTP code wrong
+# → 403 ACCOUNT_INACTIVE    — user was deactivated between steps
+# → 409 TOTP_NOT_ENABLED    — user disabled TOTP between the two calls
+
+# ── Frontend flow pseudocode ──────────────────────────────────────────────────
+#   res = POST /auth/login {email, password}
+#   if (res.data.mfa_required) {
+#     code = await promptUserForTOTPCode()
+#     res  = POST /auth/login/totp {challenge_token: res.data.challenge_token, code}
+#   }
+#   storeTokens(res.data.access_token, res.data.refresh_token)
+#
+# Google OAuth variant — the callback page checks the query string:
+#   if (query.mfa_required == "1") renderTOTPPrompt(query.challenge_token)
+#   else                           storeTokens(query.access_token, query.refresh_token)

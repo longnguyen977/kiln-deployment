@@ -1,0 +1,199 @@
+# Offer builder — /api/v1/offer
+#
+#   GET    /offer                     — { by_candidate: [], by_draft: [] }
+#   POST   /offer/drafts               — upsert one draft per (user, candidate)
+#   GET    /offer/drafts/:id           — fetch one draft (full payload)
+#   DELETE /offer/drafts/:id           — hard-delete
+#
+# Draft storage: new table `offer_drafts`. UNIQUE (user_id, candidate_id)
+# enforces "one draft per user per candidate" — re-saving overwrites in
+# place. Drafts are private per user — an HR colleague in the same org
+# doesn't see or modify your drafts.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /api/v1/offer — two parallel lists
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s http://localhost:8080/api/v1/offer \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (200 OK):
+# {
+#   "data": {
+#     "by_candidate": [
+#       {
+#         "candidate":         { "id", "full_name", "email", "current_title" },
+#         "organization_id":   "...",
+#         "organization_name": "Acme Inc",
+#         "role": {
+#           "position_id":       "...",
+#           "title":             "Senior Unity Developer",
+#           "department":        "Engineering",
+#           "team":              "Mobile Engineer",
+#           "proficiency_level": "senior",
+#           "employment_type":   "full_time",
+#           "location":          { "raw": "TP.HCM", "type": "onsite" },
+#           "salary":            { "min": 1000, "max": 1800, "currency": "USD", "text": "..." },
+#           "benefits":          [ "...", "..." ]
+#         }
+#       }
+#     ],
+#     "by_draft": [
+#       {
+#         "draft_id":  "9b71…",
+#         "status":    "draft",
+#         "saved_by":  { "id": "...", "full_name": "Alice Nguyen" },
+#         "saved_at":  "2026-04-22T08:35:42Z",      ← server-stamped
+#         "payload":   { ... full raw JSON the client saved ... }
+#       }
+#     ]
+#   },
+#   "total": { "by_candidate": 1, "by_draft": 1 }
+# }
+
+# A candidate can appear in BOTH lists — they're at interview_done AND the
+# caller has a draft started. The UI can render "Resume draft" on matching
+# pairs and dedup however it likes.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/v1/offer/drafts — save (upsert) a draft
+# ══════════════════════════════════════════════════════════════════════════════
+# The whole body is stored verbatim in payload JSONB. Required keys:
+#   candidate.id          — UUID, used for the (user, candidate) upsert key
+#   organization.id       — must match the caller's active org (or be omitted)
+# Optional:
+#   role.position_id      — indexed separately; leave empty if not yet chosen
+#   status                — one of draft / sent / discarded (default draft)
+#
+# The server STRIPS any client-supplied saved_at and replaces it with its
+# own updated_at on the response.
+
+curl -s -X POST http://localhost:8080/api/v1/offer/drafts \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "saved_at": "2026-04-22T08:35:42.516Z",
+    "candidate": {
+      "id":            "1d6071bc-6516-4d4b-b697-82b02cf46be0",
+      "full_name":     "Long Nguyen",
+      "email":         "longng977@gmail.com",
+      "current_title": "Backend/DevOps Lead"
+    },
+    "organization": {
+      "id":   "6f9d1496-993a-4e55-b4ed-592ab194e607",
+      "name": "4XAP"
+    },
+    "role": {
+      "position_id":       "6064725d-edb8-48ed-851c-f0aa594e085d",
+      "title":             "Golang Engineer",
+      "department":        "Engineering",
+      "team":              "Golang Engineer",
+      "proficiency_level": "senior",
+      "employment_type":   "full_time",
+      "start_date":        "2026-04-27",
+      "work_mode":         "hybrid",
+      "office":            "HCMC or Hanoi"
+    },
+    "compensation": {
+      "currency":      "VND",
+      "base_salary":   65000000,
+      "salary_period": "month",
+      "salary_months": 14,
+      "bonus_months":  2,
+      "signing_bonus": 1500000,
+      "derived": {
+        "monthly_base":     65000000,
+        "annual_base":      780000000,
+        "bonus_amount":     130000000,
+        "total_first_year": 911500000
+      }
+    },
+    "benefits": [
+      "BaoViet premium insurance (even during probation)",
+      "13th salary + 2 reviews/year",
+      "New Year off (Dec 29–Jan 3), full gross insurance",
+      "Macbook Pro",
+      "Flexible work",
+      "Free coffee"
+    ],
+    "custom_clauses": "",
+    "letter": {
+      "voice":           "formal",
+      "letterhead_city": "Ho Chi Minh City",
+      "signatory_name":  "Nguyễn Trường Long",
+      "signatory_title": "Head of People",
+      "respond_by":      "2026-04-29"
+    }
+  }' | jq .
+
+# Response (200 OK):
+# {
+#   "draft_id":     "9b71…",
+#   "status":       "draft",
+#   "saved_at":     "2026-04-22T15:45:00Z",                  ← trusted server time
+#   "candidate_id": "1d6071bc-6516-4d4b-b697-82b02cf46be0"
+# }
+#
+# Re-POSTing the same candidate.id overwrites in place (same draft_id) —
+# UNIQUE (user_id, candidate_id) enforces the one-draft-per-pair invariant.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /api/v1/offer/drafts/:id — fetch one draft
+# ══════════════════════════════════════════════════════════════════════════════
+DRAFT_ID="9b71…"
+curl -s http://localhost:8080/api/v1/offer/drafts/$DRAFT_ID \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response:
+# {
+#   "data": {
+#     "draft_id": "9b71…",
+#     "status":   "draft",
+#     "saved_by": { "id": "...", "full_name": "Alice Nguyen" },
+#     "saved_at": "2026-04-22T15:45:00Z",
+#     "payload":  { ... full JSON blob ... }
+#   }
+# }
+#
+# Scoped to the caller's user — another HR user in the same org gets 404
+# even if the draft id is correct.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DELETE /api/v1/offer/drafts/:id — hard delete
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X DELETE http://localhost:8080/api/v1/offer/drafts/$DRAFT_ID \
+  -H "Authorization: Bearer $TOKEN" -w "HTTP %{http_code}\n"
+# → HTTP 204 (no body)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Errors
+# ══════════════════════════════════════════════════════════════════════════════
+#  400 INVALID_BODY           — body missing or malformed JSON
+#  400 INVALID_CANDIDATE_ID   — candidate.id missing / not a UUID
+#  400 INVALID_POSITION_ID    — role.position_id present but not a UUID
+#  400 INVALID_STATUS         — status outside draft|sent|discarded
+#  403 ORG_MISMATCH           — organization.id doesn't match the JWT's org
+#  404 NOT_FOUND              — draft id doesn't exist under the caller
+#
+# 401 / MISSING_TOKEN applies to any request without Authorization.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Notes
+# ══════════════════════════════════════════════════════════════════════════════
+# - status column supports draft / sent / discarded today. /offer/drafts
+#   returns non-discarded rows; POSTing status="sent" marks the draft as
+#   dispatched (no actual email sending wired to this endpoint yet). A
+#   future POST /offer/drafts/:id/send can flip status + integrate with the
+#   Gmail send flow the same way /interviews/:id/send_email does.
+# - Drafts hard-delete on DELETE. If you want an undo UX, have the UI
+#   retry a POST with the same candidate.id — the payload lives in
+#   browser state anyway.
+# - Draft payload is intentionally untyped on the server. Frontend owns
+#   the offer-letter schema; server just stores and hands back verbatim.
+#   That means adding a new `custom_clauses_2` field tomorrow requires
+#   zero backend changes.

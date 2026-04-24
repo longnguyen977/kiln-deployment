@@ -1,0 +1,66 @@
+# Recent captures — extension popup / dashboard panel
+#
+# Returns the latest N CVs brought in by the Chrome extension (or any
+# other third-party source — topcv, itviec, linkedin, facebook, zalo…).
+# Excludes "upload" (web-app upload form) and "gmail" (Gmail importer)
+# so the panel highlights only extension/scrape captures.
+#
+# Rows still parsing (candidate not yet created) are filtered out — the
+# UI shows named captures only.
+#
+# GET /api/v1/extension/candidates/recent-captures
+#   auth:  Authorization: Bearer kiln_ext_...   ← extension token ONLY
+#          (web JWT is rejected with 401 EXTENSION_TOKEN_REQUIRED)
+#   scope: the token's pinned organization
+#   limit: fixed at 4 (popup layout). No query param.
+
+# ── Use the extension token the user pasted into the extension ────────────────
+EXT_TOKEN="kiln_ext_7fe1d4a9b3c2e5f608a1b27c9d4e6a0b5f23e89c1d4a7b3"
+
+curl -s "http://localhost:8080/api/v1/extension/candidates/recent-captures" \
+  -H "Authorization: Bearer $EXT_TOKEN" | jq .
+
+# Response (200 OK):
+# {
+#   "total": 3,
+#   "data": [
+#     { "candidate_name": "Long Nguyen",   "source": "topcv",    "uploaded_at": "2026-04-23T13:45:02Z" },
+#     { "candidate_name": "Minh Vu",       "source": "itviec",   "uploaded_at": "2026-04-23T12:20:11Z" },
+#     { "candidate_name": "Alice Pham",    "source": "linkedin", "uploaded_at": "2026-04-22T17:02:48Z" }
+#   ]
+# }
+
+# ── Scope enforcement ─────────────────────────────────────────────────────────
+
+# Web JWT sent here → blocked:
+curl -s "http://localhost:8080/api/v1/extension/candidates/recent-captures" \
+  -H "Authorization: Bearer $WEB_JWT" | jq .
+# { "error": { "code": "EXTENSION_TOKEN_REQUIRED",
+#              "message": "this endpoint only accepts extension tokens" } }
+
+# Missing Authorization header:
+curl -s "http://localhost:8080/api/v1/extension/candidates/recent-captures" | jq .
+# { "error": { "code": "MISSING_TOKEN", "message": "authorization header required" } }
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+# 401 MISSING_TOKEN             — no Authorization header
+# 401 INVALID_TOKEN             — extension token revoked / expired / unknown
+# 401 EXTENSION_TOKEN_REQUIRED  — web JWT sent to this endpoint
+# 500 FETCH_FAILED              — DB read failed
+
+# ── SQL behind this ──────────────────────────────────────────────────────────
+# SELECT q.candidate_name, cs.code AS source, q.created_at AS uploaded_at
+# FROM cv_upload_queue q
+# JOIN cvs cv        ON cv.candidate_id = q.candidate_id
+# JOIN cv_sources cs ON cs.id           = cv.source_id
+# WHERE q.organization_id = :org
+#   AND cs.code NOT IN ('upload', 'gmail')
+#   AND q.candidate_id   IS NOT NULL
+#   AND q.candidate_name IS NOT NULL
+# ORDER BY q.created_at DESC
+# LIMIT :limit;
+#
+# Projection is intentionally narrow (name + source + timestamp, no
+# emails / phones / match scores) so exposing it on the extension-token
+# surface doesn't broaden sensitive-data access — even a leaked
+# kiln_ext_* can only see the same three columns the popup shows.

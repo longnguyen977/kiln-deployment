@@ -1,0 +1,49 @@
+# POST /api/v1/auth/register
+# Register a new user and create their organization.
+# Returns access_token, refresh_token, and user info on success.
+
+curl -s -X POST http://localhost:8080/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "full_name": "Alice Smith",
+    "email": "alice@example.com",
+    "password": "supersecret",
+    "organization_name": "Acme Corp"
+  }' | jq .
+
+# ── Expected: 201 Created ──────────────────────────────────────────────────────
+# {
+#   "data": {
+#     "access_token": "eyJ...",
+#     "refresh_token": "abcdef...",
+#     "token_type": "Bearer",
+#     "expires_in": 900,
+#     "user": {
+#       "id": "...",
+#       "email": "alice@example.com",
+#       "full_name": "Alice Smith",
+#       "organization_id": "...",
+#       "role_id": "..."
+#     }
+#   }
+# }
+
+# ── Duplicate email → 409 ─────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "full_name": "Alice Again",
+    "email": "alice@example.com",
+    "password": "supersecret",
+    "organization_name": "Other Org"
+  }' | jq .
+
+# ── Validation error (short password) → 422 ───────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "full_name": "Bob",
+    "email": "bob@example.com",
+    "password": "short",
+    "organization_name": "Bob Org"
+  }' | jq .

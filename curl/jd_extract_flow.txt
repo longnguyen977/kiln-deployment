@@ -1,0 +1,141 @@
+# JD Extraction → ReactFlow preview — /api/v1/jd/extract/flow
+#
+# Same as /api/v1/jd/extract (sends text to Gemini, saves a draft in
+# jd_ai_drafts), but the response also carries a `flow` delta of React Flow
+# nodes + edges the frontend can merge straight into the org-chart view.
+#
+# The delta is CONSERVATIVE: it only contains nodes that would be NEWLY added
+# to the chart. Existing departments/teams are not re-emitted — their real
+# UUIDs are used as parent references so the frontend can link correctly.
+#
+# All preview nodes are read-only (draggable=false, connectable=false,
+# deletable=false) and carry `data.new = true` + `data.draft_id` so the UI can
+# style them as "pending" and reconcile with the confirm response later.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── POST /api/v1/jd/extract/flow ──────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract/flow \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Tuyển Golang Developer (Junior) – Lương upto 20M\nYêu cầu:\n~2 năm kinh nghiệm backend (ưu tiên Golang)\nBiết REST API, DB (MySQL/Postgres), Git\nQuyền lợi:\nLương upto 20M\nĐầy đủ chế độ theo luật\nGửi CV: hr@company.vn Tiêu đề: Golang – Họ tên"
+  }' | jq .
+
+# Expected response — identical to /jd/extract, plus a `flow` field:
+# {
+#   "id":            "3f2e1d4c-...",            ← draft UUID
+#   "how_to_apply":  "Email: hr@company.vn | Subject: CV – Golang – Họ tên",
+#   "title":         "Golang Developer (Junior)",
+#   "department":    "Engineering",
+#   "team":          "Backend Engineer",
+#   "proficiency_level": "junior",
+#   "location":      "Hà Nội",
+#   "salary_max":    20,
+#   "salary_text":   "Upto 20M",
+#   "currency":      "VND",
+#   "role_overview": "...",
+#   "requirements":  [ ... ],
+#   "responsibilities": [ ... ],
+#   "benefits":      [ ... ],
+#   "skills_required": [ ... ],
+#   "application_email": "hr@company.vn",
+#   "flow": {
+#     "nodes": [
+#       {
+#         "id":   "dept-5d3a...",        ← existing dept → real UUID reused
+#                                         (node not emitted — it's already
+#                                          on the chart; shown here for context)
+#         "type": "department",
+#         ...
+#       },
+#       {
+#         "id":   "team-draft-3f2e1d4c-...",   ← NEW team → draft id
+#         "type": "team",
+#         "position": { "x": 0, "y": 320 },
+#         "data": {
+#           "label":    "Backend Engineer",
+#           "kind":     "team",
+#           "new":      true,
+#           "draft_id": "3f2e1d4c-..."
+#         },
+#         "draggable":   false,
+#         "selectable":  true,
+#         "connectable": false,
+#         "deletable":   false
+#       },
+#       {
+#         "id":   "pos-draft-3f2e1d4c-...",    ← NEW position → draft id
+#         "type": "position",
+#         "position": { "x": 0, "y": 480 },
+#         "data": {
+#           "label":             "Golang Developer (Junior)",
+#           "kind":              "position",
+#           "new":               true,
+#           "draft_id":          "3f2e1d4c-...",
+#           "proficiency_level": "junior",
+#           "status":            "draft",
+#           "headcount":         "1"
+#         },
+#         "draggable":   false,
+#         "selectable":  true,
+#         "connectable": false,
+#         "deletable":   false
+#       }
+#     ],
+#     "edges": [
+#       {
+#         "id":     "e-dept-5d3a...-team-draft-3f2e1d4c-...",
+#         "source": "dept-5d3a...",       ← existing dept
+#         "target": "team-draft-3f2e1d4c-..."
+#       },
+#       {
+#         "id":     "e-team-draft-3f2e1d4c-...-pos-draft-3f2e1d4c-...",
+#         "source": "team-draft-3f2e1d4c-...",
+#         "target": "pos-draft-3f2e1d4c-..."
+#       }
+#     ]
+#   }
+# }
+
+# ── Node-id scheme ────────────────────────────────────────────────────────────
+# dept-<uuid>           — existing department (linked in delta.edges[*].source)
+# dept-draft-<draftID>  — NEW department, will be created on /jd/confirm
+# team-<uuid>           — existing team
+# team-draft-<draftID>  — NEW team
+# pos-draft-<draftID>   — NEW position (always, since the draft isn't confirmed)
+#
+# Flag: data.new = true on every node emitted here. Render them with a
+# "pending / dashed border" style until /jd/confirm resolves the draft.
+
+# ── Which nodes/edges get emitted ─────────────────────────────────────────────
+# Dept exists ∧ Team exists → only `pos-draft-*` + edge team→pos
+# Dept exists ∧ Team missing → `team-draft-*` + `pos-draft-*`
+#                              + edges dept→team, team→pos
+# Dept missing              → `dept-draft-*` + `team-draft-*` + `pos-draft-*`
+#                              + edges org→dept, dept→team, team→pos
+
+# ── Error: missing text ───────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract/flow \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": ""}' | jq .
+# → 400 { "error": { "code": "EMPTY_TEXT", "message": "text is required" } }
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract/flow \
+  -H "Content-Type: application/json" \
+  -d '{"text": "some jd"}' | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ── Frontend merge pattern (React Flow) ───────────────────────────────────────
+# const res = await fetch("/api/v1/jd/extract/flow", { … });
+# const { flow, id: draftId } = await res.json();
+# setNodes(prev => [...prev, ...flow.nodes]);
+# setEdges(prev => [...prev, ...flow.edges]);
+# // When user confirms via /jd/confirm, remove nodes where
+# // data.draft_id === draftId and reload /organization/structure.

@@ -1,0 +1,108 @@
+# Dashboard — Summary
+# GET /api/v1/dashboard/summary
+#
+# One-shot payload for the dashboard landing page. Org scope comes from the
+# JWT (org_id claim) and user_id is logged server-side — no query params.
+#
+# Bundles four sections:
+#   - kpis                 — four headline numbers + derived conversion rate
+#   - funnel               — stage-by-stage drop-off from candidate_stage_history
+#   - source_distribution  — candidate totals per cv_sources.code (+ 'unknown')
+#   - active_roles         — every open position, titled + taglined for cards
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/dashboard/summary ─────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/dashboard/summary \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "kpis": {
+#     "total_candidates":       42,
+#     "active_roles":           5,
+#     "ai_screened_cvs":        38,
+#     "hired_count":            3,
+#     "offer_conversion_rate":  7.14     # hired / total × 100
+#   },
+#
+#   "funnel": [
+#     { "code": "screened",            "label": "Screened",            "sort_order": 1, "count": 42 },
+#     { "code": "interview_scheduled", "label": "Interview Scheduled", "sort_order": 2, "count": 25 },
+#     { "code": "interviewing",        "label": "Interviewing",        "sort_order": 3, "count": 18 },
+#     { "code": "interview_done",      "label": "Interview Done",      "sort_order": 4, "count": 14 },
+#     { "code": "offer_sent",          "label": "Offer Sent",          "sort_order": 5, "count":  6 },
+#     { "code": "offer_accepted",      "label": "Offer Accepted",      "sort_order": 6, "count":  4 },
+#     { "code": "offer_rejected",      "label": "Offer Rejected",      "sort_order": 7, "count":  1 },
+#     { "code": "onboarding",          "label": "Onboarding",          "sort_order": 8, "count":  4 },
+#     { "code": "hired",               "label": "Hired",               "sort_order": 9, "count":  3 },
+#     { "code": "rejected",            "label": "Rejected",            "sort_order":10, "count":  8 }
+#   ],
+#
+#   "source_distribution": {
+#     "total": 42,
+#     "by_source": [
+#       { "source": "upload",   "count": 25 },
+#       { "source": "gmail",    "count": 12 },
+#       { "source": "linkedin", "count":  0 },
+#       { "source": "unknown",  "count":  5 }
+#     ]
+#   },
+#
+#   "active_roles": [
+#     {
+#       "id":                "b7d3...",
+#       "title":             "Senior Product Designer",
+#       "tagline":           "A rare design generalist — systems thinker who can ship.",
+#       "department":        "Design",
+#       "team":              "Product Design",
+#       "proficiency_level": "senior",
+#       "headcount":         1,
+#       "match_cv":          8
+#     },
+#     {
+#       "id":                "c11a...",
+#       "title":             "Golang Developer (Junior)",
+#       "tagline":           "",
+#       "department":        "Engineering",
+#       "team":              "Backend Engineer",
+#       "proficiency_level": "junior",
+#       "headcount":         2,
+#       "match_cv":          3
+#     }
+#   ]
+# }
+
+# ── Notes on the numbers ──────────────────────────────────────────────────────
+# total_candidates       : candidates.deleted_at IS NULL, scoped to JWT's org
+# active_roles           : job_positions.status = 'open'
+#                          (excludes draft/filled/closed — filled is auto-set
+#                           by the hire trigger when headcount hits 0)
+# ai_screened_cvs        : DISTINCT cv_id in cv_ai_reviews
+# hired_count            : candidates whose CURRENT stage is 'hired'
+# offer_conversion_rate  : hired_count / total_candidates × 100, rounded 2dp
+#                          (0 when total is 0 — no NaN leaks into JSON)
+#
+# funnel[*].count        : DISTINCT candidates who have EVER reached this
+#                          stage (from candidate_stage_history). "Ever
+#                          reached" semantics → shows real drop-off, not a
+#                          current-state snapshot.
+#                          Stages with zero count still appear so the chart
+#                          has a stable axis.
+#
+# source_distribution    : reuses CountCandidatesBySource — every active
+#                          cv_sources row appears even when count=0.
+#
+# active_roles[*].tagline: job_descriptions.summary (the 1–2 sentence role
+#                          pitch the AI extractor produces). "" when no JD
+#                          has been confirmed yet.
+# active_roles[*].match_cv: distinct CVs currently matched to this position
+#                          whose candidate is still alive (not soft-deleted).
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/dashboard/summary | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

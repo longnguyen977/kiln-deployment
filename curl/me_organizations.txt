@@ -1,0 +1,218 @@
+# Me — Organizations — /api/v1/me/organizations
+#
+# Returns every organization the current user is a member of, together with
+# the role they hold in each and a flag showing which one is currently
+# active (the org_id encoded in the JWT).
+#
+# Data model: a user has one row in `users` (with a primary organization_id
+# + role_id), plus one row per membership in `organization_members`. New
+# signups get their primary membership seeded automatically by the Register
+# flow, so /me/organizations always returns at least one org.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/me/organizations ──────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/me/organizations \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": [
+#     {
+#       "id":         "0f8e5e08-....",
+#       "name":       "Acme Inc.",
+#       "slug":       "acme-inc",
+#       "is_primary": true,      ← the default org used at login
+#       "is_active":  true,      ← matches the current JWT's org_id
+#       "joined_at":  "2026-01-15T09:30:00Z",
+#       "role_id":    "6af1...",
+#       "role_name":  "admin"
+#     },
+#     {
+#       "id":         "c55a-...",
+#       "name":       "Freelance Studio",
+#       "slug":       "freelance-studio-a91",
+#       "is_primary": false,
+#       "is_active":  false,
+#       "joined_at":  "2026-03-02T14:12:00Z",
+#       "role_id":    "91bc...",
+#       "role_name":  "recruiter"
+#     }
+#   ],
+#   "total": 2,
+#   "active_organization_id": "0f8e5e08-..."
+# }
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# - Solo HR accounts (the common case) will see a single row with
+#   is_primary=true and is_active=true.
+# - Adding the current user to another org is a future endpoint (invite flow).
+#   The schema already supports it: insert a row into organization_members
+#   with is_primary=false and the desired role_id.
+# - Switching the active org means re-issuing the JWT with a different
+#   org_id claim — also a follow-up endpoint. Until that ships, the active
+#   org is whichever one was the user's `users.organization_id` at login.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/v1/me/organizations
+# Creates a new organization. The caller is automatically added as the new
+# org's admin (is_primary=false, since they already have a primary org from
+# signup). The returned JWT is NOT re-issued — the caller stays scoped to
+# their currently active org; a future /switch endpoint will change that.
+# ══════════════════════════════════════════════════════════════════════════════
+
+curl -s -X POST http://localhost:8080/api/v1/me/organizations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Freelance Studio"}' | jq .
+
+# Expected response (201 Created) — same shape as one item from the GET list:
+# {
+#   "id":         "c55a-...",
+#   "name":       "Freelance Studio",
+#   "slug":       "freelance-studio-a91",   ← auto-suffixed to avoid collisions
+#   "is_primary": false,                    ← user's primary org is the first one
+#   "is_active":  false,                    ← JWT still points to the old active org
+#   "joined_at":  "2026-04-20T22:34:47Z",
+#   "role_id":    "91bc...",
+#   "role_name":  "admin"
+# }
+#
+# Frontend pattern: POST → response item, append to the local /me/organizations
+# list. Then (future) call the switch endpoint to re-issue the token before
+# acting inside the new workspace.
+
+# ── Validation rules ──────────────────────────────────────────────────────────
+# - name: required, 2–255 characters after trim
+# → 400 INVALID_BODY   for malformed JSON
+# → 400 INVALID_NAME   for missing / too-short / too-long names
+
+# ── Error: name too short ─────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/me/organizations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": ""}' | jq .
+# → 400 { "error": { "code": "INVALID_NAME", "message": "name must be at least 2 characters" } }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/v1/me/organizations/:id/switch
+# Changes the caller's active organization. Verifies the caller is a member
+# of the target org, revokes the current session, and returns a brand-new
+# JWT pair scoped to the new org_id.
+#
+# IMPORTANT: the frontend MUST replace the stored access/refresh tokens with
+# the response. The old tokens are revoked — continuing to use them returns
+# 401 SESSION_REVOKED.
+# ══════════════════════════════════════════════════════════════════════════════
+
+OTHER_ORG_ID="c55a-..."   # copy from GET /me/organizations
+
+curl -s -X POST "http://localhost:8080/api/v1/me/organizations/$OTHER_ORG_ID/switch" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK) — same shape as POST /auth/login:
+# {
+#   "data": {
+#     "access_token":  "eyJhbGci...",   ← new token, org_id = OTHER_ORG_ID
+#     "refresh_token": "rt_...",
+#     "expires_in":    3600,
+#     "user": {
+#       "id":              "u-uuid",
+#       "email":           "alice@example.com",
+#       "full_name":       "Alice",
+#       "organization_id": "c55a-...",       ← now the new active org
+#       "role_id":         "91bc..."         ← role in the new org
+#     }
+#   }
+# }
+
+# ── Error: already on that org ────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/me/organizations/<current-org>/switch" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "ALREADY_ACTIVE", "message": "already active on this organization" } }
+
+# ── Error: not a member ───────────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/me/organizations/<someone-else-org>/switch" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 403 { "error": { "code": "NOT_A_MEMBER", "message": "you are not a member of that organization" } }
+
+# ── Error: bad UUID in URL ────────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/me/organizations/not-a-uuid/switch" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_ORG_ID", "message": "organization id must be a valid UUID" } }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DELETE /api/v1/me/organizations/:id
+# Soft-deletes the target organization. Returns 204 No Content on success.
+#
+# The caller must be an admin of the target. The organization row keeps its
+# data but is marked deleted (organizations.deleted_at = NOW()); partial
+# unique indexes that filter on "deleted_at IS NULL" free up the slug, so
+# the name/slug becomes reusable.
+#
+# Guards (each returns a distinct error code):
+#   - Cannot delete the org you are currently logged into (switch first)
+#   - Cannot delete your last remaining org (would orphan you)
+#   - Cannot delete an org that still has other members (future invite flow
+#     will relax this — today the check is effectively a no-op for solo HR)
+#
+# When the deleted org was the caller's primary (users.organization_id),
+# the tx atomically:
+#   1. Picks another membership (oldest remaining) as the new primary
+#   2. Updates users.organization_id + users.role_id to it
+#   3. Flips is_primary=TRUE on the replacement membership row
+# Guaranteed invariant: every user row still has at least one matching
+# is_primary=TRUE row in organization_members after the tx.
+# ══════════════════════════════════════════════════════════════════════════════
+
+TARGET_ORG_ID="c55a-..."   # org to delete — NOT your currently active one
+
+curl -s -X DELETE "http://localhost:8080/api/v1/me/organizations/$TARGET_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" -w "HTTP %{http_code}\n"
+
+# Success:
+# HTTP 204
+# (no response body)
+
+# ── Error: deleting active org ────────────────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/me/organizations/<active-org>" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 409 { "error": { "code": "ACTIVE_ORG", "message": "cannot delete the organization you are currently active in — switch to another one first" } }
+
+# ── Error: not a member ───────────────────────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/me/organizations/<someone-else-org>" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "NOT_A_MEMBER", "message": "you are not a member of that organization" } }
+
+# ── Error: not admin ──────────────────────────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/me/organizations/<recruiter-only-org>" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 403 { "error": { "code": "NOT_ADMIN", "message": "only organization admins can delete the organization" } }
+
+# ── Error: last remaining org ─────────────────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/me/organizations/<only-org>" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 409 { "error": { "code": "LAST_ORG", "message": "cannot delete your last remaining organization" } }
+
+# ── Error: other members exist ────────────────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/me/organizations/<shared-org>" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 409 { "error": { "code": "HAS_OTHER_MEMBERS", "message": "organization still has other members — remove them first" } }
+
+# ── Error: bad UUID ───────────────────────────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/me/organizations/not-a-uuid" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_ORG_ID", "message": "organization id must be a valid UUID" } }
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/me/organizations | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ── Error: token with missing org context ─────────────────────────────────────
+# The middleware now rejects any JWT whose org_id claim is the zero UUID.
+# This guards tenant-scoped queries from running against a NULL org.
+# → 401 { "error": { "code": "INVALID_TOKEN", "message": "token missing organization context" } }

@@ -1,0 +1,74 @@
+# Candidate AI Review
+# Score + analytics + rank/percentile for a candidate against their matched pool.
+# Returned inline on GET /api/v1/candidates/:id under the "ai_review" field.
+
+# ── How it works ──────────────────────────────────────────────────────────────
+# 1. After a CV is uploaded, ProcessCV runs MatchCVToPool (Gemini quick pass)
+#    which picks the best pool and writes pool_id + match_score onto the cvs row.
+# 2. In a background goroutine, extractAndSaveCV runs the deep extraction, then
+#    reviewAndSave produces a structured review (strengths/gaps/questions) and
+#    an authoritative score, stored in cv_ai_reviews (keyed UNIQUE on cv_id).
+# 3. The reviewer score overwrites cvs.match_score so the candidate list shows
+#    the final, trustworthy number.
+# 4. Rank / top_percent are computed WITHIN THE POOL using cv_ai_reviews.
+#
+# One review per CV. If the same real person uploads two CVs (Option B model:
+# each CV = its own candidate row) you get two candidate rows, each with its
+# own cv_ai_reviews entry against whatever pool that CV matched to.
+
+# ── analytics JSON structure (inside ai_review.analytics) ─────────────────────
+# {
+#   "total_in_pool": 25,
+#   "avg_score":     72.5,
+#   "rank":          3,
+#   "top_percent":   12
+# }
+# Reading: candidate is #3 / 25 in the pool — in the top 12% (88th percentile).
+# analytics_text is a pre-rendered human-readable version of the same thing.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/candidates/:id — pull the ai_review field ─────────────────────
+CANDIDATE_ID="paste-candidate-uuid-here"
+
+curl -s "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data.ai_review'
+
+# Response (all 12 fields the handler returns):
+# {
+#   "id":                "uuid",            ← cv_ai_reviews.id
+#   "team_id":           "uuid",
+#   "role_title":        "Unity Developer (Game)",
+#   "department":        "Engineering",
+#   "team":              "Unity Engineer",
+#   "proficiency_level": "middle",
+#   "date_posted":       "2026-04-18",
+#   "match_score":       85,
+#   "analytics_text":    "Ranked #3 out of 25 in the Unity Engineer pool — top 12% of applicants",
+#   "key_strengths":     [ { "title": "...", "description": "..." }, ... ],
+#   "potential_gaps":    [ { "title": "...", "description": "..." }, ... ],
+#   "suggested_interview_questions": [
+#     { "question": "...", "category": "...", "recommended_for": "..." },
+#     ...
+#   ]
+# }
+
+# ── ai_review is null if ───────────────────────────────────────────────────────
+# - The CV is still parsing (MatchCVToPool hasn't returned yet), OR
+# - MatchCVToPool returned team_id="" (no pool in the org fits), OR
+# - Deep extraction / reviewAndSave hasn't completed yet (runs in background).
+
+# ── Field origins ─────────────────────────────────────────────────────────────
+# pool, department, proficiency_level → derived from pools + departments by
+#   joining on cv_ai_reviews.pool_id.
+# role_title → title of the pool's current job_description (is_current=TRUE).
+#   Empty string if the pool has no confirmed JD yet.
+# match_score → cv_ai_reviews.score (overwrites the initial matcher score on
+#   the cvs row via SyncCVMatchScore).
+# analytics_text → pre-rendered from the analytics JSON (rank + top_percent).
+# key_strengths / potential_gaps / suggested_interview_questions → JSONB arrays
+#   populated by Gemini during reviewAndSave.

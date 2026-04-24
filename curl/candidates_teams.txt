@@ -1,0 +1,53 @@
+# Candidates — Pools screen
+# GET /api/v1/candidates/teams
+# Returns every active pool with a short description and total candidate count.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/candidates/teams ──────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates/teams \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": [
+#     {
+#       "id":                 "uuid",
+#       "name":               "Backend Engineer",
+#       "description":        "We are looking for a Backend Engineer to build scalable APIs...",
+#       "total_requisitions": 2,     ← Golang Developer + Java Developer both count
+#       "total_talent":       12
+#     },
+#     {
+#       "id":                 "uuid",
+#       "name":               "Frontend Engineer",
+#       "description":        "Join our frontend team to craft beautiful user interfaces...",
+#       "total_requisitions": 1,
+#       "total_talent":       7
+#     },
+#     {
+#       "id":                 "uuid",
+#       "name":               "UI/UX Design",
+#       "description":        null,  ← no confirmed JD for this pool yet
+#       "total_requisitions": 0,
+#       "total_talent":       0
+#     }
+#   ],
+#   "total": 3
+# }
+#
+# Notes:
+# - description: pulled from job_descriptions.summary of the most recently
+#   confirmed position in the pool (null if no position has been confirmed yet)
+# - total_requisitions: count of active job positions (status not draft/filled,
+#   not deleted) in the pool — each open role counts separately
+# - total_talent: count of distinct candidates whose latest CV was matched to
+#   this pool (cvs.pool_id). Soft-deleted candidates are excluded.
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates/teams | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

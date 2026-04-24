@@ -1,0 +1,183 @@
+# Interview scheduling + calendar integration
+#
+# Uses the candidate_stages taxonomy (INT FK → candidate_stages), the same stages
+# shown on the candidate profile: screened, interview_scheduled, interviewing,
+# interview_done, offer_sent, offer_accepted, offer_rejected, onboarding, hired.
+#
+# All endpoints require a Bearer JWT. Replace $TOKEN below.
+# Candidate and interviewer IDs must belong to the caller's organization.
+
+TOKEN="eyJ..."
+CANDIDATE_ID="7846d8c0-2660-4554-ad00-88ed86cf9d8a"
+INTERVIEWER_ID="6f9d1496-993a-4e55-b4ed-592ab194e607"
+
+# ── POST /api/v1/interviews ──────────────────────────────────────────────────
+# Drag-drop create. Client drops a candidate onto a calendar slot.
+#   - candidate_stage_id is optional: defaults to the candidate's current stage
+#     (candidates.candidate_stage_id) so the interview shows up at the right
+#     point in the journey. Pass a specific stage id to override.
+#   - interviewer_ids: JSONB array of user UUIDs. Conflict check runs server-side.
+#   - type: phone|video|onsite|technical|hr|panel|take_home
+#   - scheduled_at: RFC3339 with timezone.
+#   - duration_minutes: 15–480.
+#
+# SIDE EFFECT: after the interview row is created the candidate's pipeline
+# stage is advanced to 'interview_scheduled' and a row is appended to
+# candidate_stage_history attributed to the calling user. Works for both
+# first-round schedules and follow-up rounds — the round count lives on the
+# interview list, not on the stage code. Stage-update failure is logged
+# but does NOT fail the interview create (201 still returned).
+curl -s -X POST http://localhost:8080/api/v1/interviews \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "candidate_id": "'"$CANDIDATE_ID"'",
+    "type": "video",
+    "scheduled_at": "2026-04-20T14:00:00+07:00",
+    "duration_minutes": 45,
+    "location": "Google Meet (link TBD)",
+    "interviewer_ids": ["'"$INTERVIEWER_ID"'"],
+    "notes": "Tech screen — focus on Unity + C#"
+  }' | jq .
+
+# ── Expected 201 ─────────────────────────────────────────────────────────────
+# {
+#   "data": {
+#     "id": "…",
+#     "candidate_id": "…",
+#     "candidate_name": "THUONG CAO NGUYEN",
+#     "candidate_stage_id": 1,
+#     "stage_code": "screened",
+#     "stage_label": "Screened",
+#     "type": "video",
+#     "scheduled_at": "2026-04-20T14:00:00+07:00",
+#     "end_at":       "2026-04-20T14:45:00+07:00",
+#     "duration_minutes": 45,
+#     "location": "Google Meet (link TBD)",
+#     "interviewer_ids": ["…"],
+#     "status": "scheduled",
+#     "candidate_confirmed": false,
+#     "outcome": "",
+#     "calendar_event_id": "",
+#     "created_by": "…",
+#     "created_at": "…",
+#     "updated_at": "…"
+#   }
+# }
+
+# ── Overriding stage explicitly (e.g. 2 = interview_scheduled) ───────────────
+curl -s -X POST http://localhost:8080/api/v1/interviews \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "candidate_id": "'"$CANDIDATE_ID"'",
+    "candidate_stage_id": 2,
+    "type": "onsite",
+    "scheduled_at": "2026-04-22T10:00:00+07:00",
+    "duration_minutes": 60,
+    "interviewer_ids": ["'"$INTERVIEWER_ID"'"]
+  }' | jq .
+
+# ── Error: missing candidate_id → 400 MISSING_CANDIDATE ──────────────────────
+curl -s -X POST http://localhost:8080/api/v1/interviews \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"video","scheduled_at":"2026-04-20T14:00:00+07:00","duration_minutes":45}' | jq .
+
+# ── Error: past slot → 400 PAST_SCHEDULED_AT ─────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/interviews \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"candidate_id":"'"$CANDIDATE_ID"'","type":"video","scheduled_at":"2020-01-01T10:00:00Z","duration_minutes":60}' | jq .
+
+# ── Error: interviewer already booked → 409 INTERVIEWER_CONFLICT ─────────────
+
+# ── GET /api/v1/interviews?from=…&to=… ───────────────────────────────────────
+# Calendar view. `from` and `to` must be RFC3339. Range ≤ 366 days.
+# Returns every interview whose [scheduled_at, scheduled_at+duration] overlaps [from, to].
+curl -s -G http://localhost:8080/api/v1/interviews \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "from=2026-04-20T00:00:00+07:00" \
+  --data-urlencode "to=2026-04-27T00:00:00+07:00" | jq .
+
+# ── Expected 200 ─────────────────────────────────────────────────────────────
+# {
+#   "data": [
+#     {
+#       "id": "…",
+#       "candidate_id": "…",
+#       "candidate_name": "…",
+#       "candidate_stage_id": 2,
+#       "stage_code": "interview_scheduled",
+#       "stage_label": "Interview Scheduled",
+#       "scheduled_at": "…",
+#       "end_at": "…",
+#       ...
+#     }
+#   ]
+# }
+
+# ── GET /api/v1/interviews/:id ───────────────────────────────────────────────
+INTERVIEW_ID="REPLACE_WITH_REAL_ID"
+curl -s http://localhost:8080/api/v1/interviews/$INTERVIEW_ID \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── GET /api/v1/candidates/:id/interviews ────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/interviews \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── PATCH /api/v1/interviews/:id/reschedule ──────────────────────────────────
+# Drag to a new slot. Re-runs interviewer conflict check (excluding this interview).
+curl -s -X PATCH http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/reschedule \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "scheduled_at": "2026-04-21T10:00:00+07:00",
+    "duration_minutes": 60
+  }' | jq .
+
+# ── Error: new slot collides with another interview → 409 INTERVIEWER_CONFLICT
+
+# ── PATCH /api/v1/interviews/:id ─────────────────────────────────────────────
+# Edit non-time fields. Pass the full desired state (type, candidate_stage_id,
+# location, interviewer_ids, notes, candidate_confirmed).
+curl -s -X PATCH http://localhost:8080/api/v1/interviews/$INTERVIEW_ID \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "type": "onsite",
+    "candidate_stage_id": 3,
+    "location": "HQ — Meeting Room 3A",
+    "interviewer_ids": ["'"$INTERVIEWER_ID"'"],
+    "notes": "Bring laptop for pair-programming",
+    "candidate_confirmed": true
+  }' | jq .
+
+# ── POST /api/v1/interviews/:id/cancel ───────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/cancel \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"note":"Candidate asked to reschedule via email"}' | jq .
+
+# ── POST /api/v1/interviews/:id/complete ─────────────────────────────────────
+# outcome: pass|fail|hold|pending.
+curl -s -X POST http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/complete \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "outcome": "pass",
+    "note": "Strong Unity fundamentals. Recommend onsite."
+  }' | jq .
+
+# ── Error: bad outcome → 400 INVALID_OUTCOME ─────────────────────────────────
+
+# ── DELETE /api/v1/interviews/:id ────────────────────────────────────────────
+curl -s -X DELETE http://localhost:8080/api/v1/interviews/$INTERVIEW_ID \
+  -H "Authorization: Bearer $TOKEN" -w "\nHTTP %{http_code}\n"
+# Expected: HTTP 204
+
+# ── Candidate stage reference (candidate_stages table) ───────────────────────
+# id | code                | label
+# ---+---------------------+-----------------------
+#  1 | screened            | Screened
+#  2 | interview_scheduled | Interview Scheduled
+#  3 | interviewing        | Interviewing
+#  4 | interview_done      | Interview Done
+#  5 | offer_sent          | Offer Sent
+#  6 | offer_accepted      | Offer Accepted
+#  7 | offer_rejected      | Offer Rejected
+#  8 | onboarding          | Onboarding
+#  9 | hired               | Hired

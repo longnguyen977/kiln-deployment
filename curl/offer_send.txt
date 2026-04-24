@@ -1,0 +1,108 @@
+# Offer letter — send via Gmail with PDF attachment
+# POST /api/v1/offer/drafts/:id/send
+#
+# Sends the offer-letter email to the candidate using the caller's
+# connected Gmail account, with the AI-generated PDF attached. On success
+# appends one row to offer_sent_emails (append-only log) and flips
+# offer_drafts.status from 'draft' to 'sent'.
+#
+# PREREQUISITES (in order of checks):
+#   1. Draft exists and belongs to the caller         (404 NOT_FOUND)
+#   2. Candidate has a canonical_email                (409 NOT_READY)
+#   3. offer_letter_ai_drafts.status = 'ready'        (409 NOT_READY)
+#   4. Rendered PDF present on disk                   (409 PDF_MISSING)
+#   5. Google OAuth creds configured for the org      (503 GOOGLE_NOT_CONFIGURED)
+#   6. Gmail integration connected for the org        (404 NOT_FOUND)
+#   7. Stored refresh token still valid               (401 GMAIL_REAUTH_REQUIRED)
+#
+# Body (all fields OPTIONAL — server defaults to the AI draft):
+#   subject : string — overrides the AI-generated subject
+#   body    : string — overrides the AI-generated body
+# Recipient is LOCKED to candidates.canonical_email; no override allowed,
+# to prevent accidental wrong-recipient sends from a stale draft.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+DRAFT_ID="<uuid from POST /offer/drafts>"
+
+# ── Happy path: send the AI-drafted email as-is ───────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/offer/drafts/$DRAFT_ID/send" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq .
+
+# Response (200 OK):
+# {
+#   "data": {
+#     "id":               "a5b2c1…",                    ← offer_sent_emails.id
+#     "offer_draft_id":   "<draft_id>",
+#     "recipient":        "candidate@example.com",      ← from payload.candidate.email
+#     "subject":          "Your offer from 4XAP — Golang Engineer",
+#     "body":             "Dear Long Nguyen,\n\n…",
+#     "pdf_filename":     "Offer_Long_Nguyen_2026-04-22.pdf",
+#     "gmail_message_id": "19318d1a2f0e3c7b",
+#     "gmail_thread_id":  "19318d1a2f0e3c7b",
+#     "sent_at":          "2026-04-22T17:14:33Z",
+#     "sent_by":          "<user uuid>"
+#   }
+# }
+
+# ── With HR edits overriding subject + body ───────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/offer/drafts/$DRAFT_ID/send" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subject": "Offer for Golang Engineer — please review",
+    "body":    "Hi Long,\n\nAttached is the formal offer. Let us know by Wednesday.\n\n— Alice"
+  }' | jq .
+
+# ── What the recipient receives ───────────────────────────────────────────────
+# • From: the Gmail account the HR user connected via /integrations/gmail
+# • To:   candidates.canonical_email for this draft
+# • Subject: the one passed (override) or the AI-drafted one
+# • Body:    text/plain UTF-8 (base64 transfer-encoded inside the MIME)
+# • Attachment: application/pdf named "Offer_<slug>_<date>.pdf"
+# The message is multipart/mixed — text/plain body part + pdf attachment
+# part. Works in every mainstream mail client.
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+# 400 INVALID_ID            — draft id isn't a valid UUID
+# 404 NOT_FOUND             — draft not under the caller OR no Gmail integration
+# 409 NOT_READY             — one of: no candidate email, AI preview still
+#                             generating / failed, subject/body empty
+# 409 PDF_MISSING           — ai-draft row says status=ready but the PDF
+#                             file on disk has been deleted
+# 401 GMAIL_REAUTH_REQUIRED — stored refresh token is dead; redirect user
+#                             to /api/v1/integrations/gmail/connect then
+#                             retry this POST
+# 500 SEND_FAILED           — generic Gmail API / network error
+# 500 SEND_LOG_FAILED       — the email DID go out (gmail id in message),
+#                             but the offer_sent_emails INSERT failed
+#                             (should be rare; ops can manually reconcile)
+# 503 GOOGLE_NOT_CONFIGURED — server has no Google OAuth client configured
+#                             at all (check .env GOOGLE_CLIENT_ID/SECRET)
+
+# ── Frontend pattern ──────────────────────────────────────────────────────────
+# After POST /offer/drafts triggers /preview goroutine:
+#   1. Long-poll /drafts/:id/preview?wait=45  → status:"ready"
+#   2. User reviews the preview in an iframe blob-URL (see offer_preview.txt)
+#   3. User clicks "Send" → POST /drafts/:id/send
+#   4. On 200 OK: toast "Sent to <recipient>", refresh the offer list
+#      (offer_drafts.status flips from 'draft' to 'sent', so the draft
+#       moves between tabs of the /offer two-list view).
+#   5. On 401 GMAIL_REAUTH_REQUIRED: redirect to
+#      /api/v1/integrations/gmail/connect; come back + retry.
+
+# ── Data model ────────────────────────────────────────────────────────────────
+# offer_sent_emails  — append-only log, one row per Gmail send
+#   (id, offer_draft_id, ai_draft_id, organization_id, sent_by,
+#    recipient, subject, body, pdf_file_id, pdf_filename,
+#    gmail_message_id, gmail_thread_id, sent_at)
+#
+# Each send is a new row; resending after an edit produces a second row.
+# Draft.status = 'sent' after the first successful send — re-POSTing
+# doesn't toggle it back.

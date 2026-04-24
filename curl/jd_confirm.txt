@@ -1,0 +1,122 @@
+# JD Confirm API — POST /api/v1/jd/confirm
+# Takes a draft_id from /jd/extract plus the (possibly user-edited) JD data.
+# Saves to job_positions + job_descriptions, generates a PDF, marks draft confirmed.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── Step 1: extract to get a draft_id ────────────────────────────────────────
+DRAFT_ID=$(curl -s -X POST http://localhost:8080/api/v1/jd/extract \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "BACK-END DEVELOPER (GOLANG)\nLocation: Quận 3, TP.HCM\nSalary: 1,000 – 1,800 USD/month\nYêu cầu: Golang, REST API, SQL, NoSQL, Cloud, 2+ năm kinh nghiệm\nQuyền lợi: Lương cạnh tranh, team quốc tế\nContact: lethitamhr@gmail.com"
+  }' | jq -r '.id')
+
+echo "Draft ID: $DRAFT_ID"
+
+# ── Step 2: confirm with (optionally edited) JD data ─────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"draft_id\": \"$DRAFT_ID\",
+    \"title\": \"BACK-END DEVELOPER (GOLANG)\",
+    \"location\": \"Quận 3, TP.HCM\",
+    \"location_type\": \"onsite\",
+    \"employment_type\": \"full_time\",
+    \"salary_min\": 1000,
+    \"salary_max\": 1800,
+    \"salary_text\": \"1,000 – 1,800 USD/month\",
+    \"currency\": \"USD\",
+    \"seniority_level\": \"mid\",
+    \"language\": \"vi\",
+    \"role_overview\": \"Vai trò này tập trung vào việc xây dựng và tối ưu hóa hệ thống backend cho các game online và HTML5 sử dụng Golang.\",
+    \"requirements\": [
+      \"Required Skills: Golang, REST API, SQL, NoSQL, Cloud (AWS / Azure / GCP), CI/CD (Jenkins, GitLab CI/CD, Azure DevOps)\",
+      \"2+ năm kinh nghiệm Backend / Software Engineering\",
+      \"Tiếng Anh làm việc tốt\"
+    ],
+    \"responsibilities\": [
+      \"Xây dựng backend cho online & HTML5 games\",
+      \"Design & optimize RESTful APIs (performance, security, scalability)\",
+      \"Làm việc với Game Designer, Product, QA\",
+      \"Debug, optimize system (high load, real-time)\",
+      \"Tham gia design system architecture\",
+      \"Hỗ trợ CI/CD & deployment pipeline\"
+    ],
+    \"nice_to_have\": [
+      \"Kinh nghiệm với Microservices (MSA), Kafka, CQRS, Actor Model\",
+      \"Đã làm game backend\",
+      \"Đam mê game\"
+    ],
+    \"benefits\": [
+      \"Lương cạnh tranh + deal theo năng lực\",
+      \"Làm việc với team quốc tế (Singapore)\",
+      \"Dự án game innovative – global scale\",
+      \"Môi trường mở, support, học hỏi nhanh\"
+    ],
+    \"skills_required\": [\"Golang\", \"REST API\", \"SQL\", \"NoSQL\", \"AWS\", \"Azure\", \"GCP\", \"CI/CD\", \"Jenkins\", \"GitLab CI/CD\", \"Microservices\", \"Kafka\", \"CQRS\"],
+    \"application_email\": \"lethitamhr@gmail.com\",
+    \"application_phone\": \"\",
+    \"application_note\": \"Inbox hoặc comment để nhận JD chi tiết!\"
+  }" | jq .
+
+# Expected response (201 Created):
+# {
+#   "position_id":    "uuid",    ← created job_positions row
+#   "description_id": "uuid",   ← created job_descriptions row
+#   "pdf_file_id":    "uuid",   ← file_objects row for the PDF
+#   "pdf_path":       "org-id/jd/position-id_back-end-developer-golang.pdf"
+# }
+#
+# ── Side effect: auto-rematch unmatched CVs ──────────────────────────────────
+# After the response is sent, the server fires a background goroutine that
+# scans `cvs` in this org for rows with pool_id IS NULL (CVs uploaded before
+# any pool fit them) and re-runs MatchCVToPool against the current pools +
+# JDs — which now include the one just confirmed.
+#
+# For each CV that now matches a pool, the rematch worker:
+#   1. Flips cv_upload_queue status done → parsing (UI shows re-processing).
+#   2. Writes the new pool_id + match_score to the cvs row.
+#   3. Loads the existing deep extraction from cv_extractions (cached from the
+#      original upload) and runs reviewAndSave → a fresh cv_ai_reviews row
+#      with strengths/gaps/interview questions for the matched pool.
+#   4. Flips the queue back to done.
+#
+# The review is generated using the STORED extraction — no re-extraction call
+# — so rematch cost is exactly 2 Gemini calls per CV (1 match + 1 review),
+# same as a fresh upload's foreground path.
+#
+# Watch for log markers:
+#   [rematch] starting rematch
+#   [rematch] rematched           cv_id=… team_id=… score=…
+#   [review]  review saved        cv_id=… team_id=… score=…
+#   [rematch] rematch complete    checked=N matched=M
+#
+# No API to poll — re-fetch /candidates a few seconds after confirm; newly
+# matched CVs will have pool_name set and ai_review populated.
+
+# ── Error: draft already confirmed ───────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"draft_id\": \"$DRAFT_ID\", \"title\": \"Test\"}" | jq .
+# → 409 { "error": { "code": "DRAFT_ALREADY_CONFIRMED", ... } }
+
+# ── Error: draft not found / wrong org ───────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"draft_id": "00000000-0000-0000-0000-000000000000", "title": "x"}' | jq .
+# → 404 { "error": { "code": "DRAFT_NOT_FOUND", ... } }
+
+# ── Error: missing title ──────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"draft_id\": \"$DRAFT_ID\"}" | jq .
+# → 400 { "error": { "code": "MISSING_DATA", ... } }

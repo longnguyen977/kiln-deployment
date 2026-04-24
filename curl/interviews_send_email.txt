@@ -1,0 +1,141 @@
+# Interviews — Send AI-drafted invitation email via Gmail
+# POST /api/v1/interviews/:id/send_email
+#
+# Sends the AI-drafted (or HR-edited) invitation email to the candidate
+# using the Gmail account the org connected under /integrations/gmail.
+# Appends one row to interview_sent_emails; /interviews/:id/info switches
+# email_draft.status from "ready" → "sent" on the next fetch.
+#
+# PREREQUISITE: the org must have an active Gmail integration with
+# gmail.send scope granted. That scope is requested by default at connect
+# time (see internal/google/google.go); existing integrations connected
+# before this endpoint shipped already have it.
+#
+# STORAGE: new table interview_sent_emails — append-only log. Each send is
+# a fresh row. The UI shows the latest row only; admins can query the
+# whole table to see every send (who/when/what).
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+INTERVIEW_ID="<uuid from POST /api/v1/interviews>"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Send using the AI draft as-is (no overrides)
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X POST "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/send_email" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": {
+#     "id":               "b7d3…",                     ← interview_sent_emails.id
+#     "interview_id":     "…",
+#     "recipient":        "candidate@example.com",     ← candidate's canonical_email
+#     "subject":          "Interview Invitation — Unity Developer at Acme",
+#     "body":             "Hi Vũ,\n\nThanks for applying…",
+#     "gmail_message_id": "19318d1a2f0e3c7b",          ← Gmail API returns this
+#     "gmail_thread_id":  "19318d1a2f0e3c7b",
+#     "sent_at":          "2026-04-22T10:15:33Z",
+#     "sent_by":          "<user uuid>"
+#   }
+# }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Send with HR edits (overrides the AI draft)
+# Recipient is NOT overridable — always the candidate's email. Prevents a
+# typo or stolen-session wrong-recipient send.
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X POST "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/send_email" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subject": "Welcome to round 2 — Acme technical interview",
+    "body":    "Hi Vũ,\n\nCongrats on clearing the first round. We'\''d love to invite you to a 60-minute technical deep-dive on Unity gameplay systems this Thursday at 14:00 ICT over Google Meet. Reply to confirm.\n\nLooking forward to speaking with you."
+  }' | jq .
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /api/v1/interviews/:id/info AFTER sending
+# email_draft.status flips to "sent" and the new last_send block surfaces
+# the audit metadata.
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/info" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected (truncated) response:
+# {
+#   "data": {
+#     ...interview fields...,
+#     "candidate_full_name": "Bùi Minh Vũ",
+#     "candidate_email":     "candidate@example.com",
+#     "email_draft": {
+#       "status":     "sent",                               ← was "ready" before send
+#       "subject":    "Interview Invitation — Unity …",     ← snapshot of what went out
+#       "body":       "Hi Vũ, …",
+#       "updated_at": "2026-04-22T10:15:33Z",
+#       "last_send": {
+#         "id":               "b7d3…",
+#         "recipient":        "candidate@example.com",
+#         "gmail_message_id": "19318d1a2f0e3c7b",
+#         "gmail_thread_id":  "19318d1a2f0e3c7b",
+#         "sent_at":          "2026-04-22T10:15:33Z",
+#         "sent_by": {
+#           "id":        "<user uuid>",
+#           "full_name": "Alice Nguyen"
+#         }
+#       }
+#     }
+#   }
+# }
+#
+# The "subject" and "body" at the top level of email_draft reflect the LAST
+# SEND SNAPSHOT when status == "sent", not the AI draft. Draft edits stay
+# in interview_ai_email_drafts; the snapshot in interview_sent_emails is
+# immutable history of what actually went out.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Re-sending (round 2, reminder, etc.)
+# Just call /send_email again — a new interview_sent_emails row is appended.
+# Older sends stay in the table; /info shows the latest one.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Error: candidate has no email on file ─────────────────────────────────────
+# → 409 { "error": { "code": "NOT_READY", "message": "cannot send: candidate has no email on file, or draft is still generating" } }
+
+# ── Error: AI draft not generated yet (and no overrides provided) ────────────
+# → 409 NOT_READY — wait for the draft goroutine, then retry, or pass
+# subject+body explicitly in the request body.
+
+# ── Error: Gmail integration not connected ────────────────────────────────────
+# → 404 { "error": { "code": "NOT_FOUND", "message": "interview or Gmail integration not found — connect Gmail under /integrations/gmail first" } }
+
+# ── Error: interview not found ────────────────────────────────────────────────
+# → 404 NOT_FOUND (same code, different cause)
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/send_email" \
+  -H "Content-Type: application/json" -d '{}' | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Data model
+# ══════════════════════════════════════════════════════════════════════════════
+# interview_ai_email_drafts  — one row per interview (UNIQUE on interview_id)
+#                              Rewritten every time the goroutine or a future
+#                              /regenerate endpoint runs.
+# interview_sent_emails      — append-only log, one row per Gmail send
+#                              (id, interview_id, draft_id, sent_by,
+#                               recipient, subject, body,
+#                               gmail_message_id, gmail_thread_id, sent_at)
+#                              Snapshot of exactly what was sent, even if
+#                              HR edited the draft before sending.
+#
+# /info reads:
+#   1. interview + candidate + latest draft  (GetInterviewInfoWithEmailDraft)
+#   2. latest send row                       (GetLatestInterviewSend)
+# and merges them into one email_draft block.

@@ -1,0 +1,123 @@
+# Notifications — bell-icon inbox for the signed-in user
+#
+# Two access scopes (query param ?scope):
+#   scope=org  (DEFAULT) — rows for the user's ACTIVE organization only
+#   scope=all            — rows across EVERY org the user has belonged to
+#                          (user keeps their history even if membership is
+#                          later revoked — the notification was to them)
+#
+# Events currently written:
+#   ai_review_ready  — deep AI review finished for a candidate
+#   ai_score_ready   — final match score synced onto the CV
+#   cv_import_done   — Gmail CV import job transitioned to a terminal status
+#   jd_confirmed     — JD draft was confirmed into a real position
+#
+# Endpoints (all require Authorization: Bearer <jwt>):
+#   GET    /api/v1/notifications                 list  (scope + cursor)
+#   GET    /api/v1/notifications/unread_count    badge (scope)
+#   POST   /api/v1/notifications/:id/read        mark one (idempotent)
+#   POST   /api/v1/notifications/read_all        mark every row in scope
+#
+# Pagination is cursor-based on created_at. First page omits ?before;
+# subsequent pages pass the `next_cursor` string the server returned.
+# `next_cursor` is empty when the caller reached the end.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── List (default scope=org) ──────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/notifications?limit=20" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (200 OK):
+# {
+#   "scope": "org",
+#   "next_cursor": "2026-04-22T14:02:11Z",
+#   "data": [
+#     {
+#       "id":             "b1e4…",
+#       "type":           "ai_review_ready",
+#       "title":          "AI review ready for Long Nguyen",
+#       "body":           "Score 87 · rank #3 of 12",
+#       "link_type":      "candidate",
+#       "link_id":        "c2f9…",
+#       "data":           {"cv_id":"…","position_id":"…","score":87,"rank":3,"total":12},
+#       "organization_id":"o3a1…",
+#       "read_at":        "",
+#       "created_at":     "2026-04-22T16:20:02Z"
+#     },
+#     …
+#   ]
+# }
+
+# ── Cross-org inbox ──────────────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/notifications?scope=all&limit=50" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Next page (pass `next_cursor` as ?before) ────────────────────────────────
+curl -s "http://localhost:8080/api/v1/notifications?scope=org&before=2026-04-22T14:02:11Z" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Badge count ───────────────────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/notifications/unread_count" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# { "data": { "unread": 4, "scope": "org" } }
+
+curl -s "http://localhost:8080/api/v1/notifications/unread_count?scope=all" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# { "data": { "unread": 11, "scope": "all" } }
+
+# ── Mark ONE as read (idempotent) ─────────────────────────────────────────────
+NOTIF_ID="b1e4..."  # id from the list response
+curl -s -X POST "http://localhost:8080/api/v1/notifications/$NOTIF_ID/read" \
+  -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
+# 204 No Content
+
+# ── Mark ALL in scope as read ────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/notifications/read_all?scope=org" \
+  -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
+# 204 No Content
+
+# For the "mark everything I have read" button in the cross-org view:
+curl -s -X POST "http://localhost:8080/api/v1/notifications/read_all?scope=all" \
+  -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+# 400 INVALID_SCOPE   — ?scope= is neither 'org' nor 'all'
+# 400 INVALID_CURSOR  — ?before= couldn't be parsed as RFC3339
+# 400 INVALID_ID      — :id in /:id/read isn't a valid UUID
+# 401 UNAUTHORIZED    — missing / expired JWT (middleware layer)
+# 500 FETCH_FAILED    — DB read failure on list / count
+# 500 UPDATE_FAILED   — DB write failure on mark-read paths
+
+# ── Frontend pattern ──────────────────────────────────────────────────────────
+# Bell icon in the top bar:
+#   1. Mount:    GET /notifications/unread_count          → show dot if unread > 0
+#   2. Click:    GET /notifications?scope=org&limit=20    → dropdown rows
+#   3. Click row: deep-link via link_type + link_id:
+#        candidate  → /candidates/<link_id>
+#        cv         → /candidates/<candidate_id from .data>
+#        import_job → /integrations/gmail (scroll to job_id)
+#        jd         → /requisitions/<link_id>
+#      …then POST /notifications/<row.id>/read
+#   4. "Mark all as read" button → POST /notifications/read_all?scope=org
+#   5. A toggle switches scope=org ↔ scope=all; re-fetch both list + count
+#
+# Polling cadence: refetch unread_count every 30s while the tab is focused.
+# Cheap — single indexed count query on a partial index. Real-time push is
+# an explicit non-goal for now (no SSE/WebSocket plumbing).
+
+# ── Data model ────────────────────────────────────────────────────────────────
+# notifications (partitioned by created_at quarterly since 2026-Q1)
+#   id, user_id, organization_id NULL, type, title, body,
+#   link_type, link_id, data JSONB,
+#   read_at, created_at
+#
+# type CHECK constrains rows to the four events above. Adding a new event
+# type requires a migration to widen the CHECK.
+#
+# Retention: none. No cleanup job — rows grow O(candidates × HRs). Trivial
+# to add a 90-day purge or per-quarter DETACH later if cost becomes an issue.

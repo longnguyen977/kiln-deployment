@@ -1,0 +1,139 @@
+# Per-job public links
+#
+# HR opens ONE job → clicks "Generate public link" → gets a URL they
+# can share anywhere. The URL points at that single job only. No
+# org-wide careers page; each job is individually opt-in.
+#
+# Three admin endpoints (scoped by position id):
+#   POST   /api/v1/jd/requisitions/:id/public-link   generate (rotates if one exists)
+#   GET    /api/v1/jd/requisitions/:id/public-link   fetch current link
+#   DELETE /api/v1/jd/requisitions/:id/public-link   kill the URL
+#
+# Plus the reader side — what candidates hit:
+#   GET    /api/v1/public/jobs/:key          job detail
+#   GET    /api/v1/public/jobs/:key/jd.pdf   JD download
+#   POST   /api/v1/public/jobs/:key/apply    submit CV (PDF or DOCX)
+#
+# And the requisitions list now carries `has_public_link: true|false`
+# per row so the HR UI can show a "link live" badge without a second
+# round trip.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ADMIN (web JWT)
+# ═════════════════════════════════════════════════════════════════════════════
+
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+POSITION_ID="a11b..."
+
+# ── Generate a public link for one job (rotates if one already exists) ───────
+curl -s -X POST "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/public-link" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# 201 Created:
+# {
+#   "data": {
+#     "url":        "http://localhost:3000/jobs/kiln_pub_7fe1d4a9b3c2e5f608a1b27c9d4e6a0b5f23e89c1d4a7b3",
+#     "key_prefix": "kiln_pub_7fe1",
+#     "created_at": "2026-04-23T19:00:00Z"
+#   }
+# }
+# ^ copy `url`, paste anywhere (LinkedIn post, website, cold email).
+
+# ── Fetch the current link ───────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/public-link" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# 200 with the same `{url, key_prefix, created_at}` shape,
+# or 404 NO_LINK if HR hasn't generated one.
+
+# ── Revoke (kills the URL immediately) ───────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/public-link" \
+  -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
+# 204
+
+# ── Requisitions list shows has_public_link per row ──────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/requisitions" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data[0]'
+# {
+#   "id": "a11b...",
+#   "role_title": "Senior Go Engineer",
+#   "status": "open",
+#   "has_public_link": true,
+#   ...
+# }
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PUBLIC (no auth — the URL IS the credential)
+# ═════════════════════════════════════════════════════════════════════════════
+
+PUB_KEY="kiln_pub_7fe1d4a9b3c2e5f608a1b27c9d4e6a0b5f23e89c1d4a7b3"
+
+# ── Job detail ───────────────────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/public/jobs/$PUB_KEY" | jq .
+
+# 200 OK — whitelisted projection:
+# {
+#   "data": {
+#     "id": "a11b…",
+#     "title": "Senior Go Engineer",
+#     "department": "Engineering",
+#     "team": "Platform",
+#     "proficiency_level": "Senior",
+#     "employment_type": "full_time",
+#     "location": { "raw": "Hanoi", "type": "hybrid" },
+#     "salary": { "min": 30000000, "max": 45000000, "currency": "VND", "text": "30M – 45M VND" },
+#     "role_overview": "…",
+#     "responsibilities": ["…"],
+#     "requirements": ["…"],
+#     "benefits": ["…"],
+#     "skills_required": ["Go","Postgres","Docker"],
+#     "application": { "email": "careers@4xap.com" },
+#     "posted_at": "2026-04-23T10:15:00Z"
+#   }
+# }
+
+# ── Download the JD PDF ──────────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/public/jobs/$PUB_KEY/jd.pdf" -o job.pdf
+
+# ── Apply (PDF or DOCX, ≤10MB) ───────────────────────────────────────────────
+# Fire-and-forget: returns 200 OK immediately; the CV goes through the
+# same AI pipeline as web + extension uploads, tagged source='public_page',
+# firing notifications to the HR user who minted the link.
+curl -s -X POST "http://localhost:8080/api/v1/public/jobs/$PUB_KEY/apply" \
+  -F "file=@/path/to/cv.pdf" \
+  -F "note=Hi! Excited about the role." | jq .
+# { "data": { "message": "Thanks — we've received your application." } }
+
+# ── What 404s look like ──────────────────────────────────────────────────────
+# • Unknown / revoked key     → 404 NOT_FOUND (can't distinguish)
+# • Position was closed       → 404 NOT_FOUND (status != 'open')
+# • Position was deleted      → 404 NOT_FOUND
+# All identical payload — probers learn nothing.
+
+# ── Rate limits (per-IP, fixed window) ───────────────────────────────────────
+# detail  — 60/min
+# jd.pdf  — 10/min
+# apply   —  5/min
+
+# ── Error codes ──────────────────────────────────────────────────────────────
+# ADMIN:
+#   400 INVALID_ID         — :id isn't a UUID
+#   404 NO_LINK            — GET called when no active link exists
+#   500 MINT_FAILED        — random/DB failure on POST
+#   500 FETCH_FAILED       — DB read failure on GET
+#   500 REVOKE_FAILED      — DB write failure on DELETE
+# PUBLIC:
+#   400 INVALID_FORM / NO_FILE / UNSUPPORTED_TYPE / FILE_TOO_LARGE (apply)
+#   404 NOT_FOUND          — key / job not visible
+#   413 FILE_TOO_LARGE     — apply file > 10MB
+#   429 (limiter body)     — per-IP rate limit tripped
+
+# ── Data model ────────────────────────────────────────────────────────────────
+# job_public_links(id, position_id, organization_id, created_by,
+#                  key, key_prefix, revoked_at, created_at)
+#   UNIQUE (key)
+#   UNIQUE (position_id) WHERE revoked_at IS NULL   ← one active per job
+# The key is plaintext (it's embedded on HR's website — not a secret).

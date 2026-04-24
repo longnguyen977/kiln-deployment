@@ -1,0 +1,92 @@
+# Pipeline — Candidates with embedded stage change history
+# GET /api/v1/pipeline — same shape as /api/v1/candidates but each row has a "history" array
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/pipeline — default page 1, 20 per page ───────────────────────
+curl -s http://localhost:8080/api/v1/pipeline \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Pagination (same as /candidates) ─────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/pipeline?page=1&page_size=100" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── FILTER by source (gmail | linkedin | upload) ─────────────────────────────
+curl -s "http://localhost:8080/api/v1/pipeline?source=upload" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── FILTER by pool NAME ──────────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/pipeline?team=Mobile%20Engineer" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── FILTER by stage code ─────────────────────────────────────────────────────
+# screened, interview_scheduled, interviewing, interview_done,
+# offer_sent, offer_accepted, offer_rejected, onboarding, hired, rejected
+curl -s "http://localhost:8080/api/v1/pipeline?stage=screened" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── COMBINED filters + pagination ────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/pipeline?source=upload&stage=interviewing&page=1&page_size=50" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (200 OK):
+# {
+#   "data": [
+#     {
+#       "id":          "e6edc8bb-f671-45ff-bdc1-45cdb384db49",
+#       "full_name":   "Bùi Minh Vũ",
+#       "headline":    "Unity Game Developer at Skygo Game Studio",
+#       "email":       "minhvu190303@gmail.com",
+#       "match_score": 87,
+#       "source":      "upload",
+#       "stage":       "interviewing",
+#       "stage_label": "Interviewing",
+#       "team_name":   "Mobile Engineer",
+#       "filename":    "Bui_Minh_Vu_Unity.pdf",
+#       "history": [
+#         {
+#           "id":              "7c8b...",
+#           "stage":           "interviewing",
+#           "stage_label":     "Interviewing",
+#           "changed_at":      "2026-04-15T09:20:00Z",
+#           "changed_by_name": "Alice Nguyen",
+#           "note":            "Moved after phone screen"
+#         },
+#         {
+#           "id":              "b11a...",
+#           "stage":           "interview_scheduled",
+#           "stage_label":     "Interview Scheduled",
+#           "changed_at":      "2026-04-14T11:02:00Z",
+#           "changed_by_name": "Alice Nguyen",
+#           "note":            null
+#         },
+#         {
+#           "id":              "00e3...",
+#           "stage":           "screened",
+#           "stage_label":     "Screened",
+#           "changed_at":      "2026-04-14T10:00:00Z",
+#           "changed_by_name": null,
+#           "note":            null
+#         }
+#       ]
+#     }
+#   ],
+#   "total":     1,
+#   "page":      1,
+#   "page_size": 20
+# }
+
+# ── Query params ─────────────────────────────────────────────────────────────
+# source    — gmail | linkedin | upload
+# pool      — pool NAME (see /api/v1/candidates/filters)
+# stage     — stage code (see /api/v1/candidates/filters)
+# page      — default 1
+# page_size — default 20, max 100
+
+# ── Error: unauthenticated ───────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/pipeline | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

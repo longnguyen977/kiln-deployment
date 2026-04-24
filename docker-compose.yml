@@ -1,0 +1,55 @@
+# ──────────────────────────────────────────────────────────────────────
+# Kiln ATS — single source of truth compose file.
+#
+# Substitution vars come from deploy/<env>.env via `--env-file`:
+#   VERSION_BACKEND, VERSION_FRONTEND   image tags (e.g. 1.0.0-prod)
+#   BACKEND_ENV_FILE                    path to backend runtime env file
+#   API_URL                             frontend SSR -> backend URL
+#
+# Postgres runs on the HOST; container reaches it via host.docker.internal.
+# Storage: S3 (no host volumes).
+#
+# Managed by deploy.sh — don't edit service versions by hand.
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+  kiln-backend-service:
+    image: kiln-backend:${VERSION_BACKEND:?VERSION_BACKEND missing — run deploy.sh}
+    container_name: kiln-backend-service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - ${BACKEND_ENV_FILE:?BACKEND_ENV_FILE missing — run deploy.sh}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - kiln-network
+    # TODO: add healthcheck once backend exposes /healthz.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  kiln-frontend-service:
+    image: kiln-frontend:${VERSION_FRONTEND:?VERSION_FRONTEND missing — run deploy.sh}
+    container_name: kiln-frontend-service
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      API_URL: ${API_URL:?API_URL missing — run deploy.sh}
+    networks:
+      - kiln-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  kiln-network: {}

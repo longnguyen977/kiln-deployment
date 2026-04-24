@@ -1,0 +1,22 @@
+# POST /api/v1/auth/logout
+# Revoke the current session. Requires a valid Bearer token.
+#
+# Step 1: capture a token from login
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+echo "Token: $TOKEN"
+
+# Step 2: logout using that token
+curl -s -X POST http://localhost:8080/api/v1/auth/logout \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Expected: 200 OK ───────────────────────────────────────────────────────────
+# {
+#   "data": { "message": "logged out successfully" }
+# }
+
+# ── No token → 401 ────────────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/auth/logout | jq .

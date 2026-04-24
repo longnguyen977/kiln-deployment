@@ -1,0 +1,44 @@
+# Candidate Filters API
+# GET /api/v1/candidates/filters — get all filter options (sources, pools, stages)
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/candidates/filters — all filter options ───────────────────────
+curl -s http://localhost:8080/api/v1/candidates/filters \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": {
+#     "sources": [
+#       { "code": "gmail", "label": "Gmail" },
+#       { "code": "linkedin", "label": "Linkedin" },
+#       { "code": "upload", "label": "Upload" }
+#     ],
+#     "pools": [
+#       { "id": "uuid", "name": "Engineering" },
+#       { "id": "uuid", "name": "Sales" }
+#     ],
+#     "stages": [
+#       { "code": "screened", "label": "Screened", "sort_order": 1 },
+#       { "code": "interview_scheduled", "label": "Interview Scheduled", "sort_order": 2 },
+#       { "code": "interviewing", "label": "Interviewing", "sort_order": 3 },
+#       { "code": "interview_done", "label": "Interview Done", "sort_order": 4 },
+#       { "code": "offer_sent", "label": "Offer Sent", "sort_order": 5 },
+#       { "code": "offer_accepted", "label": "Offer Accepted", "sort_order": 6 },
+#       { "code": "offer_rejected", "label": "Offer Rejected", "sort_order": 7 },
+#       { "code": "onboarding", "label": "Onboarding", "sort_order": 8 },
+#       { "code": "hired", "label": "Hired", "sort_order": 9 }
+#     ]
+#   }
+# }
+
+# Use these filter values in the List Candidates API:
+#   source: gmail, linkedin, upload
+#   pool:   use pool "name" (not id)
+#   stage:  screened, interview_scheduled, interviewing, interview_done,
+#          offer_sent, offer_accepted, offer_rejected, onboarding, hired

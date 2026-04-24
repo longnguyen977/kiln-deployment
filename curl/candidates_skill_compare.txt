@@ -1,0 +1,141 @@
+# Candidates — Skill compare (job ↔ candidate)
+# GET /api/v1/candidates/:id/skill-compare
+#
+# Side-by-side skill table: what the candidate's matched position asks for
+# vs what the candidate has. Works off two join tables:
+#
+#   job_position_skills   (position ↔ skill) — NEW in migration 96
+#   candidate_skills      (candidate ↔ skill) — already existed
+#
+# Both sides are upserted into the same `skills` catalog, so a "Golang"
+# entry on the JD and on the CV hit the same skills.id for the join.
+#
+# Populated from the AI JD extractor: skills_required + skills_nice_to_have
+# now return { name, proficiency_level, years_min } objects — the prompt
+# asks Gemini to tag each skill with the level the JD demands
+# ("5+ years of Go" → senior, "familiarity with Docker" → junior, etc.).
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/candidates/:id/skill-compare ─────────────────────────────────
+CANDIDATE_ID="e6edc8bb-f671-45ff-bdc1-45cdb384db49"
+
+curl -s http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/skill-compare \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "position_id":         "b7d3...",
+#   "position_title":      "Backend Developer (Golang)",
+#   "candidate_id":        "e6edc8bb-...",
+#   "candidate_full_name": "Bùi Minh Vũ",
+#   "skills": [
+#     {
+#       "skill_id":              "...",
+#       "skill":                 "Golang",
+#       "requirement":           "required",
+#       "job_proficiency":       "senior",
+#       "job_years_min":         3,
+#       "candidate_has":         true,
+#       "candidate_proficiency": "middle",
+#       "candidate_years":       2.0,
+#       "matches":               false,     ← candidate is one level below
+#       "exceeds":               false
+#     },
+#     {
+#       "skill_id":              "...",
+#       "skill":                 "PostgreSQL",
+#       "requirement":           "required",
+#       "job_proficiency":       "middle",
+#       "job_years_min":         0,
+#       "candidate_has":         true,
+#       "candidate_proficiency": "senior",
+#       "candidate_years":       4.5,
+#       "matches":               true,      ← candidate meets the bar
+#       "exceeds":               true       ← and then some
+#     },
+#     {
+#       "skill_id":              "...",
+#       "skill":                 "Kubernetes",
+#       "requirement":           "required",
+#       "job_proficiency":       "junior",
+#       "job_years_min":         0,
+#       "candidate_has":         false,     ← GAP
+#       "matches":               false,
+#       "exceeds":               false
+#     },
+#     {
+#       "skill_id":              "...",
+#       "skill":                 "gRPC",
+#       "requirement":           "nice_to_have",
+#       "job_proficiency":       "",
+#       "job_years_min":         0,
+#       "candidate_has":         true,
+#       "candidate_proficiency": "middle",
+#       "candidate_years":       1.5,
+#       "matches":               true,
+#       "exceeds":               false
+#     }
+#   ],
+#   "summary": {
+#     "total_required":       3,
+#     "total_nice_to_have":   1,
+#     "matched_required":     1,
+#     "matched_nice_to_have": 1,
+#     "missing_required":     2,
+#     "missing_nice_to_have": 0
+#   }
+# }
+
+# ── Row semantics ────────────────────────────────────────────────────────────
+# requirement  = "required" | "nice_to_have"          (from the JD extractor)
+# candidate_has = true iff the candidate's CV lists this skill
+# matches       = candidate_has AND candidate_level ≥ job_level
+#                 (an empty job_proficiency counts as "any level is fine")
+# exceeds       = candidate_has AND candidate_level > job_level
+#                 (UI can render a subtle "over-qualified" badge)
+#
+# Proficiency ordering used by the compare logic:
+#   intern < fresher < junior < middle < senior < lead < principal
+#
+# Ordering in the `skills` array:
+#   1. required first, nice_to_have after
+#   2. alphabetical within each group
+# That way the UI can render "Required skills" + "Nice to have" as two
+# sub-tables without extra grouping.
+
+# ── Where the data comes from ────────────────────────────────────────────────
+# Position side (job_position_skills)   : /jd/confirm writes rows after the
+#                                         AI extractor tags every skill with
+#                                         proficiency_level + years_min.
+# Candidate side (candidate_skills)     : the CV extraction pipeline already
+#                                         populates this on upload.
+# Both sides upsert into the same `skills` catalog via UpsertSkill so the
+# join is deterministic.
+
+# ── Error: candidate has no matched position yet ─────────────────────────────
+# Happens when cvs.position_id IS NULL for the candidate's CV. Fix: confirm
+# a JD that matches + /review/retry (or wait for the rematch background job).
+curl -s http://localhost:8080/api/v1/candidates/<unmatched-id>/skill-compare \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 409 { "error": { "code": "NO_POSITION_MATCH", "message": "candidate has no matched position yet" } }
+
+# ── Error: candidate not found ───────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates/<unknown-id>/skill-compare \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "NOT_FOUND", "message": "candidate not found" } }
+
+# ── Error: bad UUID ───────────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates/not-a-uuid/skill-compare \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_ID", "message": "invalid candidate ID" } }
+
+# ── Empty result ──────────────────────────────────────────────────────────────
+# If the matched position has no rows in job_position_skills yet (common
+# for JDs confirmed BEFORE migration 96), the endpoint returns 200 with
+# skills:[] and summary totals all zero. Re-confirm the JD from a fresh
+# /jd/extract draft to populate the join table for that position.

@@ -1,0 +1,176 @@
+# Extension tokens — long-lived bearer for the Chrome extension
+#
+# The web-app JWT is short-lived. The Chrome extension is installed once
+# and needs to stay authenticated for weeks. These tokens fill that gap:
+#
+#   • Opaque random (NOT a JWT): "kiln_ext_<48 hex chars>"
+#   • sha256 stored server-side — DB leak cannot impersonate anyone
+#   • Revocable soft-delete (audit + last_used_at survive revoke)
+#   • Expiry: 1..30 days, default 30. Server clamps out-of-range TTLs.
+#   • (user_id, organization_id) scoped — baked in at mint time
+#   • SCOPE: the ONLY endpoint an extension token can hit is
+#       POST /api/v1/extension/candidates/upload
+#     Sending a kiln_ext_* token to any other route returns
+#     401 EXTENSION_TOKEN_NOT_ALLOWED. Conversely, sending a web-app JWT
+#     to /extension/... returns 401 EXTENSION_TOKEN_REQUIRED. The two
+#     surfaces never overlap.
+#
+# Token management endpoints (web JWT required):
+#   POST   /api/v1/me/extension-tokens        mint — raw token ONCE
+#   GET    /api/v1/me/extension-tokens        list (no raw values ever)
+#   DELETE /api/v1/me/extension-tokens/:id    revoke (idempotent)
+#
+# Extension-token-gated endpoint (extension token required):
+#   POST   /api/v1/extension/candidates/upload   upload PDF CV(s)
+
+# ── Log in with the web app to get a JWT ──────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── Mint a token (default 30-day TTL) ─────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/me/extension-tokens" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Alice Chrome laptop"}' | jq .
+
+# Response (201 Created — the `token` field is shown ONCE):
+# {
+#   "data": {
+#     "id":          "b41e…",
+#     "name":        "Alice Chrome laptop",
+#     "token":       "kiln_ext_7fe1d4a9b3c2e5f608a1b27c9d4e6a0b5f23e89c1d4a7b3",
+#     "token_prefix":"kiln_ext_7fe1",
+#     "expires_at":  "2026-05-23T10:15:00Z",
+#     "created_at":  "2026-04-23T10:15:00Z"
+#   }
+# }
+
+# ── List my tokens (raw values never surface) ────────────────────────────────
+curl -s "http://localhost:8080/api/v1/me/extension-tokens" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Revoke ───────────────────────────────────────────────────────────────────
+TOKEN_ID="b41e..."
+curl -s -X DELETE "http://localhost:8080/api/v1/me/extension-tokens/$TOKEN_ID" \
+  -H "Authorization: Bearer $TOKEN" -w "%{http_code}\n"
+# 204
+
+# ── The actual extension call: upload a PDF ──────────────────────────────────
+# multipart/form-data:
+#   files  — one or more PDF attachments (required)
+#   source — short origin code: topcv | itviec | linkedin | facebook | zalo |
+#            … anything else is accepted and tagged as-is (cv_sources is
+#            upserted). Empty / omitted → defaults to "upload".
+#
+# Response is 200 OK with an empty body — the handler immediately spawns a
+# goroutine that runs the full AI pipeline (extract → candidate/CV rows →
+# position match → deep review → stage history → notifications). Results
+# surface asynchronously via the /notifications bell.
+
+EXT_TOKEN="kiln_ext_7fe1d4a9b3c2e5f608a1b27c9d4e6a0b5f23e89c1d4a7b3"
+
+curl -s -X POST "http://localhost:8080/api/v1/extension/candidates/upload" \
+  -H "Authorization: Bearer $EXT_TOKEN" \
+  -F "source=topcv" \
+  -F "files=@/path/to/cv_long_nguyen.pdf" \
+  -w "%{http_code}\n"
+# 200
+
+# After the 200: watch notifications for the async result. First an
+# ai_score_ready event, then an ai_review_ready — both linked to the
+# candidate the upload produced.
+
+# ── ITviec (another job board) ───────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/extension/candidates/upload" \
+  -H "Authorization: Bearer $EXT_TOKEN" \
+  -F "source=itviec" \
+  -F "files=@/path/to/cv.pdf" -w "%{http_code}\n"
+# 200
+
+# ── Multiple files in one request ────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/extension/candidates/upload" \
+  -H "Authorization: Bearer $EXT_TOKEN" \
+  -F "source=linkedin" \
+  -F "files=@/path/to/cv1.pdf" \
+  -F "files=@/path/to/cv2.pdf" -w "%{http_code}\n"
+# 200 — both CVs processed in parallel, one notification per CV
+
+# ── Scope enforcement (what the middleware rejects) ──────────────────────────
+
+# Extension token → web endpoint (blocked):
+curl -s "http://localhost:8080/api/v1/candidates?limit=5" \
+  -H "Authorization: Bearer $EXT_TOKEN" | jq .
+# { "error": { "code": "EXTENSION_TOKEN_NOT_ALLOWED",
+#              "message": "extension tokens are not valid for this endpoint" } }
+
+# Web JWT → extension endpoint (blocked):
+curl -s -X POST "http://localhost:8080/api/v1/extension/candidates/upload" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "files=@/path/to/cv.pdf" | jq .
+# { "error": { "code": "EXTENSION_TOKEN_REQUIRED",
+#              "message": "this endpoint only accepts extension tokens" } }
+
+# Non-PDF via extension (blocked — surface is PDF-only):
+curl -s -X POST "http://localhost:8080/api/v1/extension/candidates/upload" \
+  -H "Authorization: Bearer $EXT_TOKEN" \
+  -F "files=@/path/to/cv.docx" | jq .
+# { "error": { "code": "UNSUPPORTED_TYPE",
+#              "message": "extension uploads must be application/pdf (cv.docx)" } }
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+# 400 INVALID_FORM                 — body isn't multipart/form-data
+# 400 NO_FILES                     — 'files' field missing or all entries unreadable
+# 400 UNSUPPORTED_TYPE             — one of the uploads isn't application/pdf
+# 400 INVALID_SOURCE               — source value > 50 chars
+# 400 INVALID_ID                   — :id in /me/extension-tokens/:id is not a UUID
+# 401 MISSING_TOKEN                — no Authorization header
+# 401 INVALID_TOKEN                — extension token revoked, expired, or unknown
+# 401 EXTENSION_TOKEN_NOT_ALLOWED  — ext token sent to a non-/extension route
+# 401 EXTENSION_TOKEN_REQUIRED     — web JWT sent to /extension/... route
+# 500 MINT_FAILED                  — crypto/rand or DB insert failed
+# 500 UPLOAD_FAILED                — pipeline failed (check server log)
+# 503 AI_NOT_CONFIGURED            — GOOGLE_AI_API_KEY missing server-side
+
+# ── Frontend pattern (web settings page) ──────────────────────────────────────
+# Settings → "Chrome Extension" card:
+#   1. GET /me/extension-tokens  → render table (name, prefix, expires,
+#                                   last used, status)
+#   2. "Generate new token" button:
+#        - prompt for a name ("Chrome laptop")
+#        - optional TTL slider (1..30, default 30)
+#        - POST /me/extension-tokens → modal shows raw token with Copy button
+#        - after the modal closes, the raw token is gone forever
+#   3. Each row has "Revoke" → DELETE /me/extension-tokens/:id
+#
+# ── Extension pattern (Chrome MV3 service worker) ─────────────────────────────
+# On install / first use:
+#   1. open a popup with a "Paste token" textarea
+#   2. user pastes "kiln_ext_..." from the web app's generate modal
+#   3. chrome.storage.local.set({ ext_token })
+# On upload (content script hands the scraped PDF to the service worker):
+#   const fd = new FormData();
+#   fd.append("source", "topcv");      // or "itviec", "linkedin", …
+#   fd.append("files", pdfBlob, "cv.pdf");
+#   const res = await fetch("https://api.kiln.example/api/v1/extension/candidates/upload", {
+#     method: "POST",
+#     headers: { Authorization: `Bearer ${ext_token}` },
+#     body: fd,
+#   });
+#   // 200 = accepted. Body is empty. Don't wait for the AI result — it
+#   // arrives later as a notification in the web app.
+# Handle 401 (revoked/expired) by clearing storage and prompting for a new token.
+
+# ── Data model ────────────────────────────────────────────────────────────────
+# extension_tokens
+#   id, user_id, organization_id,
+#   name, token_hash (sha256, 64-char hex), token_prefix,
+#   expires_at, last_used_at, revoked_at, created_at
+#
+# UNIQUE (token_hash). Middleware:
+#   RequireAuth          → rejects kiln_ext_* → JWT parse → session check
+#   RequireExtensionAuth → rejects non-kiln_ext_* → sha256 lookup
+#                          → FindExtensionTokenByHash already filters
+#                            revoked_at IS NULL AND expires_at > NOW()
+# Each successful lookup bumps last_used_at (best-effort).

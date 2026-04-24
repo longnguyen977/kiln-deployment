@@ -1,0 +1,156 @@
+# Candidates — CV Upload + Processing Queue
+# POST /api/v1/candidates/upload        — upload files, returns immediately (202)
+# GET  /api/v1/candidates/upload-queue  — poll processing queue (all sources: upload, gmail, zalo)
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── POST /api/v1/candidates/upload — upload one or more CVs ──────────────────
+# Files are saved to disk, queue entries created, AI processing starts in background.
+# Returns 202 Accepted immediately — no waiting for AI.
+
+curl -s -X POST http://localhost:8080/api/v1/candidates/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "files=@/path/to/Sarah_Mitchell_CV.pdf" \
+  -F "files=@/path/to/Product_Designer_Apply.pdf" | jq .
+
+# Response (202 Accepted) — returned before AI finishes:
+# {
+#   "queued": [
+#     { "id": "uuid-1", "filename": "Sarah_Mitchell_CV.pdf",      "status": "parsing" },
+#     { "id": "uuid-2", "filename": "Product_Designer_Apply.pdf", "status": "parsing" }
+#   ],
+#   "total": 2
+# }
+
+# ── GET /api/v1/candidates/upload-queue — Processing Queue table ──────────────
+# Poll this endpoint to see real-time status updates.
+# Tracks CVs from ALL ingestion sources — direct upload, Gmail import, Zalo, etc.
+# Maps to table columns: File, Source, Status, Detected Candidate, Match Pool, Match Score
+
+curl -s http://localhost:8080/api/v1/candidates/upload-queue \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (200 OK) — while still processing:
+# {
+#   "data": [
+#     {
+#       "id":             "uuid-1",
+#       "filename":       "Sarah_Mitchell_CV.pdf",
+#       "submitted_via":  "upload",
+#       "status":         "parsing",
+#       "candidate_name": null,
+#       "team_name":      null,
+#       "match_score":    0,
+#       "submitted_at":   "2026-04-15T20:20:49Z"
+#     },
+#     {
+#       "id":             "uuid-2",
+#       "filename":       "Product_Designer_Apply.pdf",
+#       "submitted_via":  "upload",
+#       "status":         "parsing",
+#       "candidate_name": null,
+#       "team_name":      null,
+#       "match_score":    0,
+#       "submitted_at":   "2026-04-15T20:20:49Z"
+#     }
+#   ],
+#   "total": 2
+# }
+
+# Response (200 OK) — after AI finishes:
+# {
+#   "data": [
+#     {
+#       "id":             "uuid-1",
+#       "filename":       "Sarah_Mitchell_CV.pdf",
+#       "submitted_via":  "upload",
+#       "status":         "done",
+#       "candidate_name": "Sarah Mitchell",
+#       "team_name":      "Backend Engineer",
+#       "match_score":    91,
+#       "submitted_at":   "2026-04-15T20:20:49Z"
+#     },
+#     {
+#       "id":             "uuid-2",
+#       "filename":       "Product_Designer_Apply.pdf",
+#       "submitted_via":  "upload",
+#       "status":         "done",
+#       "candidate_name": "Sarah Mitchell",
+#       "team_name":      "UI/UX Design",
+#       "match_score":    84,
+#       "submitted_at":   "2026-04-15T20:20:49Z"
+#     },
+#     {
+#       "id":             "uuid-3",
+#       "filename":       "John_Smith_CV.pdf",
+#       "submitted_via":  "gmail",
+#       "status":         "done",
+#       "candidate_name": "John Smith",
+#       "team_name":      "Backend Engineer",
+#       "match_score":    87,
+#       "submitted_at":   "2026-04-15T20:25:12Z"
+#     }
+#   ],
+#   "total": 3
+# }
+
+# submitted_via values (lowercase — same codes accepted by the `source` filter):
+#   "upload" — direct file upload via POST /candidates/upload
+#   "gmail"  — imported from connected Gmail inbox
+#   "zalo"   — imported from connected Zalo channel
+
+# Status values:
+#   parsing — AI is running in background
+#   done    — candidate created/updated, pool matched (or null if no match)
+#   failed  — file could not be read or AI returned an error
+
+# ── Upload a single DOCX ──────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/candidates/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "files=@/path/to/nguyen_van_a.docx" | jq .
+
+# ── POST /api/v1/candidates/upload-queue/:id/retry — retry a stuck entry ──────
+# Use when a file is stuck in "parsing" (server shutdown, AI timeout) or "failed".
+# Re-reads the file from disk, reloads pool context, and re-runs full AI pipeline.
+# Returns 202 immediately; processing continues in background.
+# Returns 409 if the entry already has status "done".
+
+QUEUE_ID="46d47c4f-4b38-4568-96ce-5ac82d30f99f"   # from upload-queue response
+
+curl -s -X POST "http://localhost:8080/api/v1/candidates/upload-queue/$QUEUE_ID/retry" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (202 Accepted):
+# { "id": "46d47c4f-...", "status": "parsing" }
+
+# Response (409 Conflict — already done):
+# { "error": { "code": "ALREADY_DONE", "message": "entry already processed successfully" } }
+
+# Response (422 Unprocessable — original file deleted from disk):
+# { "error": { "code": "FILE_NOT_FOUND", "message": "original file not found on disk" } }
+
+# ── Error: no files field ─────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/candidates/upload \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "NO_FILES", ... } }
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates/upload-queue | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# Supported formats : .pdf (best), .docx, .doc (best-effort)
+# Unsupported files : silently skipped (not added to queue)
+# Duplicate emails  : NOT auto-deduped. Each CV creates its own candidate row.
+#                     If the same person uploads two CVs (even with the same
+#                     email), you get two candidates — each with its own pool
+#                     match and AI review. Merge manually later if needed.
+# match_score       : 0–100 AI confidence. 0 = no pool matched or still parsing
+# Pool matching     : AI compares the CV against all org pools using embedded JD data.
+#                     The match (pool_id + match_score) is stored on the cvs row.
+# Multi-source      : Gmail-imported CVs appear here automatically after connecting Gmail
+#                     (see POST /api/v1/integrations/gmail/scan or OAuth connect flow)

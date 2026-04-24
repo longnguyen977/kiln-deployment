@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Deployment state — versions are managed by deploy.sh, safe to commit.
+# But real secret .env.dev / .env.prod live in env/ and are gitignored there.
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp

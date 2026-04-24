@@ -1,0 +1,70 @@
+# Candidates — Retry AI review — /api/v1/candidates/:id/review/retry
+#
+# Use when GET /api/v1/candidates/:id returns "ai_reviews": null. Common
+# reasons the first-upload pipeline did not produce a review:
+#   1. The CV had no matched position at upload time (AI couldn't pick one).
+#      Fix path: add/confirm a JD → rematch fires → then retry review.
+#   2. The Gemini review call transiently failed. Just retry.
+#   3. The org's Gemini API key was not configured at upload time.
+#      Fix path: configure the key, then retry.
+#
+# The review runs in a background goroutine. Response is 202 Accepted as
+# soon as the guards pass. Frontend should poll /candidates/:id until
+# ai_reviews is populated.
+#
+# Reuses the deep extraction stored in cv_extractions — this call pays for
+# ONE Gemini review call, not a full re-extract.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── POST /api/v1/candidates/:id/review/retry ──────────────────────────────────
+CANDIDATE_ID="e6edc8bb-f671-45ff-bdc1-45cdb384db49"
+
+curl -s -X POST "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/review/retry" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (202 Accepted):
+# {
+#   "candidate_id": "e6edc8bb-f671-45ff-bdc1-45cdb384db49",
+#   "status":       "review_scheduled"
+# }
+#
+# After a few seconds, GET /api/v1/candidates/$CANDIDATE_ID will return
+# ai_reviews populated (score, key_strengths, potential_gaps,
+# suggested_interview_questions, analytics.rank/top_percent/total_in_position).
+
+# ── Error: no CV for this candidate ───────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/candidates/<id-no-cv>/review/retry" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "NO_CV", "message": "candidate has no CV to review" } }
+
+# ── Error: CV has no matched position ─────────────────────────────────────────
+# Happens when the AI matcher couldn't find a fitting open position at upload
+# time (cvs.position_id IS NULL). Fix: confirm/create a JD, which will fire
+# RematchUnmatchedCVs and attach a position_id, then retry review.
+curl -s -X POST "http://localhost:8080/api/v1/candidates/<id-unmatched>/review/retry" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 409 { "error": { "code": "NO_POSITION_MATCH", "message": "CV has no matched position — run the rematch flow first" } }
+
+# ── Error: CV has no stored extraction ────────────────────────────────────────
+# The upload-queue entry's extraction step failed before cv_extractions was
+# written. Fix: POST /api/v1/candidates/upload-queue/:id/retry first.
+curl -s -X POST "http://localhost:8080/api/v1/candidates/<id-no-extraction>/review/retry" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 409 { "error": { "code": "NO_EXTRACTION", "message": "CV has no stored extraction — retry the upload queue entry first" } }
+
+# ── Error: Gemini not configured ──────────────────────────────────────────────
+# → 503 { "error": { "code": "AI_NOT_CONFIGURED", "message": "AI service is not configured" } }
+
+# ── Error: bad UUID ───────────────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/candidates/not-a-uuid/review/retry" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_ID", "message": "invalid candidate ID" } }
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/review/retry" | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

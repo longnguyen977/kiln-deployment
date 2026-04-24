@@ -1,0 +1,53 @@
+# Candidate Screening Summary API
+# GET /api/v1/candidates/summary — get candidate counts by stage and source
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/candidates/summary — screening dashboard counts ───────────────
+curl -s http://localhost:8080/api/v1/candidates/summary \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "data": {
+#     "total_candidates": 150,
+#     "stage_counts": [
+#       { "code": "screened", "label": "Screened", "count": 45 },
+#       { "code": "interview_scheduled", "label": "Interview Scheduled", "count": 20 },
+#       { "code": "interviewing", "label": "Interviewing", "count": 15 },
+#       { "code": "interview_done", "label": "Interview Done", "count": 10 },
+#       { "code": "offer_sent", "label": "Offer Sent", "count": 8 },
+#       { "code": "offer_accepted", "label": "Offer Accepted", "count": 5 },
+#       { "code": "offer_rejected", "label": "Offer Rejected", "count": 2 },
+#       { "code": "onboarding", "label": "Onboarding", "count": 3 },
+#       { "code": "hired", "label": "Hired", "count": 42 },
+#       { "code": "rejected", "label": "Rejected", "count": 7 }
+#     ],
+#     "source_counts": [
+#       { "source": "upload", "count": 80 },
+#       { "source": "gmail", "count": 45 },
+#       { "source": "linkedin", "count": 25 }
+#     ]
+#   }
+# }
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates/summary | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ── Use with filters ───────────────────────────────────────────────────────────
+# Get the summary first to show counts, then filter candidates
+curl -s http://localhost:8080/api/v1/candidates/summary \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Then filter by a specific stage
+curl -s "http://localhost:8080/api/v1/candidates?stage=screened" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Or filter by source
+curl -s "http://localhost:8080/api/v1/candidates?source=gmail" \
+  -H "Authorization: Bearer $TOKEN" | jq .

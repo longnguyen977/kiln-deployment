@@ -1,0 +1,130 @@
+# Interviews — Edit (type / location / time) + regenerate email draft
+# PATCH /api/v1/interviews/:id/edit
+#
+# Partial update: send only the fields you want to change. At least one of
+# type / location / scheduled_at / duration_minutes must be provided.
+#
+# SIDE EFFECT: after the update commits, the server
+#   1. DELETES the existing interview_ai_email_drafts row for this
+#      interview so any subsequent /info call reports
+#      email_draft.status = "generating" (NOT the stale pre-edit draft).
+#      A long-poll /info?wait=45 therefore blocks until the NEW draft
+#      lands instead of returning the old one immediately.
+#   2. Fires a background goroutine that asks Gemini for a fresh draft;
+#      the goroutine upserts the row when it finishes.
+# /interviews/:id/info returns the refreshed subject + body once Gemini
+# finishes (typically 10–25 s).
+#
+# If the interview had already been SENT (interview_sent_emails row
+# exists), the /info endpoint still shows the snapshot of what went out;
+# regenerating only updates the DRAFT. If HR wants to send the updated
+# invitation, call /send_email again after the draft is ready — that
+# appends a new row to interview_sent_emails.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+INTERVIEW_ID="<uuid from POST /api/v1/interviews>"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Change time only (most common: candidate asked to reschedule)
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X PATCH "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/edit" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scheduled_at":     "2026-04-24T15:30:00+07:00",
+    "duration_minutes": 60
+  }' | jq .
+
+# Response (200 OK) — full post-update interview payload:
+# {
+#   "data": {
+#     "id":               "b7d3…",
+#     "type":             "video",
+#     "scheduled_at":     "2026-04-24T15:30:00+07:00",
+#     "end_at":           "2026-04-24T16:30:00+07:00",
+#     "duration_minutes": 60,
+#     "location":         "Google Meet — link to follow",
+#     ...rest unchanged...
+#   }
+# }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Change type + location (e.g. switched from video to onsite)
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X PATCH "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/edit" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type":     "onsite",
+    "location": "Acme HQ — 3rd floor, room B"
+  }' | jq .
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Change everything at once
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X PATCH "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/edit" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type":             "technical",
+    "location":         "Google Meet — link in the calendar invite",
+    "scheduled_at":     "2026-04-25T10:00:00+07:00",
+    "duration_minutes": 90
+  }' | jq .
+
+# ══════════════════════════════════════════════════════════════════════════════
+# After editing: poll /info for the refreshed draft
+# ══════════════════════════════════════════════════════════════════════════════
+# Immediately:
+#   email_draft.status = "generating"  (old draft wiped, new one in flight)
+# A few seconds later:
+#   email_draft.status = "ready"  (new subject/body reflect the new time/type)
+curl -s "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/info" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data.email_draft'
+
+# ── Validation rules ──────────────────────────────────────────────────────────
+# type                 → one of phone, video, onsite, technical, hr, panel, take_home
+# duration_minutes     → 15–480
+# scheduled_at         → RFC3339, not more than 1 minute in the past
+# At least ONE field must be non-empty/non-zero.
+
+# ── Error: no fields provided ─────────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/edit" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}' | jq .
+# → 400 { "error": { "code": "NO_FIELDS", "message": "at least one of type, location, scheduled_at, duration_minutes must be provided" } }
+
+# ── Error: bad type ───────────────────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/edit" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"coffee_chat"}' | jq .
+# → 400 { "error": { "code": "INVALID_TYPE", ... } }
+
+# ── Error: scheduled_at in the past ───────────────────────────────────────────
+# → 400 { "error": { "code": "PAST_SCHEDULED_AT", ... } }
+
+# ── Error: duration out of range ──────────────────────────────────────────────
+# → 400 { "error": { "code": "INVALID_DURATION", ... } }
+
+# ── Error: bad scheduled_at format ────────────────────────────────────────────
+# → 400 { "error": { "code": "INVALID_SCHEDULED_AT", "message": "scheduled_at must be RFC3339" } }
+
+# ── Error: interview not found ───────────────────────────────────────────────
+# → 404 NOT_FOUND (standard mapping)
+
+# ── Difference vs existing endpoints ──────────────────────────────────────────
+# PATCH /interviews/:id               — Update: full replace of non-time fields
+#                                       (type, location, interviewer_ids, notes,
+#                                        candidate_confirmed). No draft regen.
+# PATCH /interviews/:id/reschedule    — Reschedule: time only. No draft regen.
+# PATCH /interviews/:id/edit          — THIS endpoint. Partial update of
+#                                       type + location + time. ALWAYS kicks
+#                                       the regenerate-email goroutine.
+#
+# Use /edit when the HR user changed anything the invitation email needs
+# to reflect. Use the other two when you're doing calendar-only tweaks
+# that shouldn't trigger another Gemini call.

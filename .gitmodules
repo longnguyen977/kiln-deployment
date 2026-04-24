@@ -1,0 +1,9 @@
+[submodule "backend"]
+	path = backend
+	url = git@github.com:longnguyen977/kiln-backend.git
+[submodule "frontend"]
+	path = frontend
+	url = git@github.com:longnguyen977/kiln-frontend.git
+[submodule "extensions"]
+	path = extensions
+	url = git@github.com:longnguyen977/kiln-extentions.git

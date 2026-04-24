@@ -1,0 +1,174 @@
+# Offer letter — AI email + PDF preview
+#
+#   POST /offer/drafts              → saves the draft AND fires the preview goroutine
+#   GET  /offer/drafts/:id/preview      → {subject, body, filename, url, status}
+#   GET  /offer/drafts/:id/preview.pdf  → streams the rendered PDF inline
+#
+# On each POST to /offer/drafts:
+#   1. offer_drafts row is upserted.
+#   2. offer_letter_ai_drafts row is seeded with status='generating'.
+#   3. A goroutine runs:
+#        a. Gemini generates email {subject, body} from the payload.
+#        b. The raw payload is rendered to PDF via offer_letter_design.md
+#           (letterhead → voice opening → role → comp table → benefits →
+#            custom clauses → deadline → voice closing → signature).
+#        c. PDF saved to storage/<org>/offer/<draft_id>/<filename>.
+#        d. file_objects row inserted, ai-draft row flipped to status='ready'.
+#   4. /preview returns the email + URL; /preview.pdf streams the bytes.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── 1. Save a draft (same body as /offer/drafts) ──────────────────────────────
+RESPONSE=$(curl -s -X POST http://localhost:8080/api/v1/offer/drafts \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @- <<'EOF'
+{
+  "candidate": {
+    "id":            "1d6071bc-6516-4d4b-b697-82b02cf46be0",
+    "full_name":     "Long Nguyen",
+    "email":         "longng977@gmail.com",
+    "current_title": "Backend/DevOps Lead"
+  },
+  "organization": {
+    "id":   "6f9d1496-993a-4e55-b4ed-592ab194e607",
+    "name": "4XAP"
+  },
+  "role": {
+    "position_id":       "6064725d-edb8-48ed-851c-f0aa594e085d",
+    "title":             "Golang Engineer",
+    "department":        "Engineering",
+    "team":              "Golang Engineer",
+    "proficiency_level": "senior",
+    "employment_type":   "full_time",
+    "start_date":        "2026-04-27",
+    "work_mode":         "hybrid",
+    "office":            "HCMC or Hanoi"
+  },
+  "compensation": {
+    "currency":      "VND",
+    "base_salary":   65000000,
+    "salary_period": "month",
+    "salary_months": 14,
+    "bonus_months":  2,
+    "signing_bonus": 1500000,
+    "derived": {
+      "monthly_base":     65000000,
+      "annual_base":      780000000,
+      "bonus_amount":     130000000,
+      "total_first_year": 911500000
+    }
+  },
+  "benefits": [
+    "BaoViet premium insurance",
+    "13th salary + 2 reviews/year",
+    "Macbook Pro"
+  ],
+  "custom_clauses": "",
+  "letter": {
+    "voice":           "formal",
+    "letterhead_city": "Ho Chi Minh City",
+    "signatory_name":  "Nguyễn Trường Long",
+    "signatory_title": "Head of People",
+    "respond_by":      "2026-04-29"
+  }
+}
+EOF
+)
+echo "$RESPONSE" | jq .
+DRAFT_ID=$(echo "$RESPONSE" | jq -r '.draft_id')
+
+# ── 2a. Fast-path (no wait) — first call typically returns "generating" ──────
+curl -s "http://localhost:8080/api/v1/offer/drafts/$DRAFT_ID/preview" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── 2b. Long-polling variant: ?wait=<seconds>  (max 60) ──────────────────────
+# The server blocks up to `wait` seconds, re-reading the AI draft row every
+# 500 ms. Returns the moment status flips to "ready" OR "failed"; if the
+# window elapses first, the current state is returned so the client can
+# retry. Typical Gemini + PDF render is 10–25 s, so wait=45 covers the
+# common case in one round-trip.
+curl -s --max-time 65 \
+  "http://localhost:8080/api/v1/offer/drafts/$DRAFT_ID/preview?wait=45" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected while Gemini + PDF render runs:
+# {
+#   "data": {
+#     "status":     "generating",
+#     "updated_at": "2026-04-22T16:22:57Z"
+#   }
+# }
+#
+# After ~5–25 s:
+# {
+#   "data": {
+#     "status":     "ready",
+#     "subject":    "Your offer from 4XAP — Golang Engineer",
+#     "body":       "Dear Long Nguyen,\n\nIt is with great pleasure that 4XAP…",
+#     "filename":   "Offer_Long_Nguyen_2026-04-22.pdf",
+#     "url":        "/api/v1/offer/drafts/<draft_id>/preview.pdf",
+#     "updated_at": "2026-04-22T16:23:17Z"
+#   }
+# }
+#
+# If something broke:
+# {
+#   "data": {
+#     "status": "failed",
+#     "error":  "gemini email: <reason>",
+#     "updated_at": "..."
+#   }
+# }
+# Re-save the draft (POST /offer/drafts again) to retry.
+
+# ── 3. Fetch the PDF bytes (for inline preview or download) ──────────────────
+curl -s "http://localhost:8080/api/v1/offer/drafts/$DRAFT_ID/preview.pdf" \
+  -H "Authorization: Bearer $TOKEN" \
+  -o /tmp/offer_preview.pdf
+open /tmp/offer_preview.pdf
+
+# The server sends:
+#   Content-Type: application/pdf
+#   Content-Disposition: inline; filename="Offer_Long_Nguyen_2026-04-22.pdf"
+#
+# Browser-preview pattern — bearer-token auth means <iframe src=url> won't
+# work (the browser can't attach the Authorization header on a passive
+# iframe src load). Fetch the bytes with fetch() and feed the iframe via
+# a blob URL:
+#
+#   const res  = await fetch(`/api/v1/offer/drafts/${id}/preview.pdf`, {
+#                  headers: { Authorization: `Bearer ${token}` },
+#                });
+#   const blob = await res.blob();
+#   const url  = URL.createObjectURL(blob);
+#   iframeRef.current.src = url;
+#   // Remember to URL.revokeObjectURL(url) on unmount.
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+# 404 NOT_FOUND   — draft id doesn't belong to the caller (user-scoped)
+# 404 NOT_READY   — preview goroutine hasn't finished (or was never fired
+#                   because GoogleAIAPIKey is empty)
+# 404 PDF_MISSING — ready-state row exists but the PDF file is missing on disk
+# 400 INVALID_ID  — draft id isn't a valid UUID
+# 401 MISSING_TOKEN — no Authorization header
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# - One ai-draft row per offer-draft row (UNIQUE on offer_draft_id). Re-saving
+#   the offer draft overwrites the preview in place — previous subject/body
+#   and the previous PDF are replaced.
+# - The PDF renderer follows offer_letter_design.md §3–§5: voice presets,
+#   conditional sections, work-mode sentence, comp table with highlight row.
+#   Typography uses DejaVu Sans Condensed (Vietnamese-capable) when available
+#   via the go-pdf/fpdf module cache — falls back to Helvetica otherwise.
+# - Language of the email defaults to English today. Adding a draft-level
+#   `letter.language` field in the payload + wiring it through
+#   offerEmailInputFromPayload is a <10-line change when you need VI output.
+# - Emailing the PDF via Gmail is NOT wired yet — /offer/drafts/:id/preview
+#   just returns the draft email + PDF URL. A future POST /offer/drafts/:id/send
+#   can hit gmail.SendEmail with the PDF as an attachment and append an
+#   offer_sent_emails row, mirroring the interview-invitation path.

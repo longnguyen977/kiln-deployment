@@ -1,0 +1,124 @@
+# Active Requisitions API
+# GET    /api/v1/jd/requisitions                    — list open/closed positions (filter: ?department_id, ?pool_id)
+# GET    /api/v1/jd/requisitions/:id/pdf            — generate & download PDF
+# GET    /api/v1/jd/requisitions/:id/docx           — generate & download DOCX
+# PATCH  /api/v1/jd/requisitions/:id/status        — change status to open|closed
+# DELETE /api/v1/jd/requisitions/:id               — soft-delete a position
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/jd/requisitions — all positions ───────────────────────────────
+curl -s http://localhost:8080/api/v1/jd/requisitions \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── GET with department filter ────────────────────────────────────────────────
+DEPT_ID="paste-department-uuid-here"
+curl -s "http://localhost:8080/api/v1/jd/requisitions?department_id=$DEPT_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── GET with pool filter ──────────────────────────────────────────────────────
+TEAM_ID="paste-pool-uuid-here"
+curl -s "http://localhost:8080/api/v1/jd/requisitions?team_id=$TEAM_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── GET with department + pool filter ────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/requisitions?department_id=$DEPT_ID&team_id=$TEAM_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Error: invalid department_id ─────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/requisitions?department_id=not-a-uuid" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_DEPARTMENT_ID", ... } }
+
+# Expected response (200 OK):
+# {
+#   "data": [
+#     {
+#       "id":                "uuid",
+#       "role_title":        "BACK-END DEVELOPER (GOLANG)",
+#       "department":        "Engineering",
+#       "team":              "Backend Engineer",
+#       "proficiency_level": "middle",
+#       "date_posted":       "2026-04-15",
+#       "match_cv":          3,
+#       "status":            "open"
+#     }
+#   ],
+#   "total": 1
+# }
+#
+# match_cv — distinct CVs currently assigned to this requisition's pool
+# (cvs.pool_id = job_positions.pool_id AND cvs.is_latest = TRUE), with the
+# candidate still live (candidates.deleted_at IS NULL). Under Option B each
+# CV belongs to its own candidate, so this is effectively "how many CVs
+# landed in this pool" — not de-duped by person.
+
+# ── GET /api/v1/jd/requisitions/:id/pdf — download PDF ───────────────────────
+# PDF layout:
+#   BACK-END DEVELOPER (GOLANG)          ← title (#1a1a2e, bold 20pt)
+#   Engineering  ›  Backend Engineer     ← dept › pool breadcrumb (#2e4a7a, bold)
+#   Loc: X   ·   Type: X   ·   Salary: X ← meta line (muted grey)
+#   ─────────────────────────────────────
+#   ROLE OVERVIEW  /  STRATEGIC RESPONSIBILITIES  /  SKILLS REQUIRED  /  BENEFITS  /  HOW TO APPLY
+POSITION_ID="paste-position-id-here"
+
+curl -s "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/pdf" \
+  -H "Authorization: Bearer $TOKEN" \
+  --output "jd_${POSITION_ID}.pdf"
+echo "Saved to jd_${POSITION_ID}.pdf"
+
+# ── Error: position not found ─────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/jd/requisitions/00000000-0000-0000-0000-000000000000/pdf" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "POSITION_NOT_FOUND", ... } }
+
+# ── GET /api/v1/jd/requisitions/:id/docx — download DOCX ─────────────────────
+# DOCX layout mirrors the PDF: title → dept › pool → meta → sections
+curl -s "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/docx" \
+  -H "Authorization: Bearer $TOKEN" \
+  --output "jd_${POSITION_ID}.docx"
+echo "Saved to jd_${POSITION_ID}.docx"
+
+# ── PATCH /api/v1/jd/requisitions/:id/status — close a position ──────────────
+POSITION_ID="paste-position-id-here"
+
+curl -s -X PATCH "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/status" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "closed"}' | jq .
+# → 200 { "id": "uuid", "status": "closed" }
+
+# ── PATCH — reopen a closed position ─────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/status" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "open"}' | jq .
+# → 200 { "id": "uuid", "status": "open" }
+
+# ── Error: invalid status value ───────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID/status" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "paused"}' | jq .
+# → 400 { "error": { "code": "INVALID_STATUS", ... } }
+
+# ── DELETE /api/v1/jd/requisitions/:id — soft-delete a position ──────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 204 No Content
+
+# ── Error: delete again (already deleted) ────────────────────────────────────
+curl -s -X DELETE "http://localhost:8080/api/v1/jd/requisitions/$POSITION_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "POSITION_NOT_FOUND", ... } }
+
+# ── Error: wrong org / non-existent id ───────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/jd/requisitions/00000000-0000-0000-0000-000000000000/status" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "closed"}' | jq .
+# → 404 { "error": { "code": "POSITION_NOT_FOUND", ... } }

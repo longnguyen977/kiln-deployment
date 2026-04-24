@@ -1,0 +1,134 @@
+# Candidates — List & Filter
+# GET /api/v1/candidates — paginated candidate table with optional filters
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/candidates — default page 1, 20 per page ─────────────────────
+curl -s http://localhost:8080/api/v1/candidates \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Pagination ────────────────────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/candidates?page=2&page_size=10" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── FILTER by source ──────────────────────────────────────────────────────────
+# Available sources: gmail, linkedin, upload
+curl -s "http://localhost:8080/api/v1/candidates?source=gmail" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── FILTER by team name ───────────────────────────────────────────────────────
+# Use team NAME (not ID)
+curl -s "http://localhost:8080/api/v1/candidates?team=Engineering" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── FILTER by stage ───────────────────────────────────────────────────────────
+# Available stages: screened, interview_scheduled, interviewing, interview_done,
+#                   offer_sent, offer_accepted, offer_rejected, onboarding,
+#                   hired, rejected
+curl -s "http://localhost:8080/api/v1/candidates?stage=screened" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── COMBINED filters ──────────────────────────────────────────────────────────
+# Filter by source + team + stage
+curl -s "http://localhost:8080/api/v1/candidates?source=upload&team=Engineering&stage=interviewing" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Full example: filters + pagination ────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/candidates?source=gmail&stage=screened&page=1&page_size=10" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (200 OK):
+# {
+#   "data": [
+#     {
+#       "id":                              "e6edc8bb-f671-45ff-bdc1-45cdb384db49",
+#       "full_name":                       "Bùi Minh Vũ",
+#       "headline":                        "Unity Game Developer (2D & 3D Mobile Games) at Skygo Game Studio",
+#       "email":                           "minhvu190303@gmail.com",
+#       "candidate_proficiency_level_id":  "3",
+#       "candidate_proficiency_level":     "middle",
+#       "require_proficiency_level":       "middle",
+#       "match_score":                     87,
+#       "source":                          "upload",
+#       "stage":                           "screened",
+#       "stage_label":                     "Screened",
+#       "team_name":                       "Mobile Engineer",
+#       "filename":                        "Bui_Minh_Vu_Unity.pdf"
+#     },
+#     {
+#       "id":                              "2c585715-6cb7-433a-99df-720a9fbc75b7",
+#       "full_name":                       "Trần Sơn Tùng",
+#       "headline":                        "Junior Unity Developer at CÔNG TY TNHH CÔNG NGHỆ KRONIA",
+#       "email":                           "tungst0509@gmail.com",
+#       "candidate_proficiency_level_id":  "2",
+#       "candidate_proficiency_level":     "junior",
+#       "require_proficiency_level":       "middle",
+#       "match_score":                     82,
+#       "source":                          "upload",
+#       "stage":                           "screened",
+#       "stage_label":                     "Screened",
+#       "team_name":                       "Mobile Engineer",
+#       "filename":                        "Tran_Son_Tung_CV.docx"
+#     }
+#   ],
+#   "total":     2,
+#   "page":      1,
+#   "page_size": 20
+# }
+#
+# Field origins:
+# - candidate_proficiency_level_id / candidate_proficiency_level: the candidate's
+#   own level (from candidates.proficiency_level_id → proficiency_levels.code),
+#   derived from their CV by the AI extractor.
+# - require_proficiency_level: the level the CANDIDATE'S MATCHED POSITION asks
+#   for (job_positions.proficiency_level_id → proficiency_levels.code). Use to
+#   render a "middle candidate, position wants senior" mismatch badge in the UI.
+# - source is the cv_sources.code of the candidate's CV (upload | gmail | zalo).
+# - match_score comes from cvs.match_score (overwritten by the AI reviewer after
+#   deep extraction).
+# - team_name is the team that owns the matched position (cvs.position_id →
+#   job_positions.team_id → teams.name).
+# - filename is the original uploaded file name from cv_upload_queue.filename.
+#   Under Option B the same person can appear multiple times with different
+#   filenames — this is the field to disambiguate "which CV is this candidate?"
+
+# ── Query params ──────────────────────────────────────────────────────────────
+# source    — filter by source: gmail, linkedin, upload
+# team      — filter by team NAME (get from /candidates/filters)
+# stage     — filter by stage code (get from /candidates/filters)
+# page      — page number, default 1
+# page_size — rows per page, default 20, max 100
+
+# ── Column mapping (frontend table head) ──────────────────────────────────────
+# Candidate Information → full_name (line 1) + headline (line 2)
+# Candidate level       → candidate_proficiency_level  (fresher|junior|middle|…)
+# Required level        → require_proficiency_level    (from the matched position)
+# AI Match Score        → match_score  (0–100)
+# Source                → source       ("upload" | "gmail" | "zalo")
+# Stage                 → stage        (code) + stage_label (display name)
+# Match Team            → team_name    (matched team, empty if no position match)
+
+# ── Pipeline stages ───────────────────────────────────────────────────────────
+# screened            — right after AI extracts data
+# interview_scheduled — HR scheduled an interview
+# interviewing        — candidate is interviewing
+# interview_done      — interview finished
+# offer_sent          — offer sent to candidate
+# offer_accepted      — candidate accepted the offer
+# offer_rejected      — candidate rejected the offer (candidate → HR)
+# onboarding          — candidate is onboarding
+# hired               — candidate has been hired (trigger decrements headcount)
+# rejected            — rejected by HR (HR → candidate)
+
+# ── Get filter options ────────────────────────────────────────────────────────
+# Use /candidates/filters to get available teams and stages
+curl -s http://localhost:8080/api/v1/candidates/filters \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/candidates | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

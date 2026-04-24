@@ -1,0 +1,119 @@
+# Me — TOTP (2FA setup scaffolding)
+#
+#   GET    /api/v1/me/totp/status
+#   POST   /api/v1/me/totp/setup
+#   POST   /api/v1/me/totp/verify   { "code": "123456" }
+#   POST   /api/v1/me/totp/disable  { "code": "123456" }
+#
+# All endpoints require the bearer token — caller is identified via the
+# user_id claim on the JWT.
+#
+# IMPORTANT: this is SCAFFOLDING only. /auth/login has NOT been wired to
+# require a TOTP code yet, even if totp_enabled=true. The intent is to ship
+# the enrollment UI first, let users opt in, and then gate login in a
+# follow-up change when we know stable users have enrolled successfully.
+#
+# Storage: totp_secret + totp_enabled + totp_confirmed_at on users.
+# Lifecycle:
+#   no secret, disabled              → never set up
+#   secret present, not enabled      → /setup called, /verify pending
+#   secret present, enabled          → TOTP active
+#
+# Library: github.com/pquerna/otp (RFC 6238, SHA1, 6 digits, 30s step).
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /api/v1/me/totp/status
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s http://localhost:8080/api/v1/me/totp/status \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Fresh user (never set up):
+# { "enabled": false, "pending_setup": false }
+#
+# Mid-setup (secret stored, not yet verified):
+# { "enabled": false, "pending_setup": true }
+#
+# Enabled:
+# { "enabled": true, "pending_setup": false, "confirmed_at": "2026-04-21T20:53:35Z" }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/v1/me/totp/setup
+# Generates a fresh secret, stores it in pending state, returns what the UI
+# needs to show the user (either a QR code from otpauth_url or manual entry
+# via the raw secret).
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X POST http://localhost:8080/api/v1/me/totp/setup \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# {
+#   "secret":      "JBSWY3DPEHPK3PXP",                           ← base32
+#   "otpauth_url": "otpauth://totp/Kiln:alice@example.com?secret=JBSWY...&issuer=Kiln"
+# }
+#
+# Frontend pattern:
+#   - Render otpauth_url as a QR code (e.g. qrcode.js)
+#   - Offer "can't scan? enter manually" → show `secret`
+#   - User opens their authenticator app, scans/types, gets a 6-digit code
+#   - POST it to /verify to finish setup
+
+# ── Error: already enabled ────────────────────────────────────────────────────
+# /setup refuses to rotate a live secret. Disable first with /disable.
+# → 409 { "error": { "code": "ALREADY_ENABLED", "message": "TOTP is already enabled — disable first to rotate the secret" } }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/v1/me/totp/verify
+# First-time activation: user enters the 6-digit code from their app, server
+# validates against the pending secret, and flips totp_enabled=true +
+# stamps totp_confirmed_at.
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X POST http://localhost:8080/api/v1/me/totp/verify \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "123456"}' | jq .
+
+# Success: { "enabled": true }
+#
+# Errors:
+# → 400 NO_PENDING_SETUP   — /setup wasn't called yet
+# → 409 ALREADY_ENABLED    — already on, use /disable to rotate
+# → 401 INVALID_CODE       — code doesn't match
+# → 400 INVALID_CODE       — code wasn't 6 digits after trim
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/v1/me/totp/disable
+# Turns TOTP off AND wipes the stored secret. Requires a current valid code
+# so a stolen session cookie alone can't remove the factor — user must still
+# be in possession of the authenticator app.
+# ══════════════════════════════════════════════════════════════════════════════
+curl -s -X POST http://localhost:8080/api/v1/me/totp/disable \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "654321"}' | jq .
+
+# Success: { "enabled": false }
+#
+# Errors:
+# → 409 NOT_ENABLED    — TOTP wasn't on
+# → 401 INVALID_CODE   — code doesn't match
+
+# ══════════════════════════════════════════════════════════════════════════════
+# End-to-end flow (what the onboarding UI does)
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. User clicks "Enable 2FA"            → GET /me/totp/status        (check state)
+# 2. User confirms                       → POST /me/totp/setup        (get QR)
+# 3. User scans + enters first code      → POST /me/totp/verify       (enabled=true)
+# 4. Later, user clicks "Disable 2FA"    → prompt for current code → POST /me/totp/disable
+#
+# After /verify, users.totp_enabled=TRUE. Login is still password-only for
+# now; a later change will read this flag during /auth/login and require an
+# additional code on matching users.
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/me/totp/status | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

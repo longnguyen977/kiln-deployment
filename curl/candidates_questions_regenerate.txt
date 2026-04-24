@@ -1,0 +1,81 @@
+# Candidates — Regenerate interview questions
+# POST /api/v1/candidates/:id/review/questions/regenerate
+#
+# Asks Google Gemini for 3 NEW interview questions tailored to this
+# candidate + their matched position, specifically avoiding the themes
+# already covered by the existing questions (read straight from
+# cv_ai_reviews.suggested_questions).
+#
+# On success the new set is written back to cv_ai_reviews.suggested_questions
+# (the rest of the review — score, strengths, gaps, analytics — stays
+# intact) and returned inline.
+#
+# Synchronous: one Gemini call, usually < 10s.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── POST /api/v1/candidates/:id/review/questions/regenerate ──────────────────
+CANDIDATE_ID="e6edc8bb-f671-45ff-bdc1-45cdb384db49"
+
+curl -s -X POST "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/review/questions/regenerate" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK):
+# {
+#   "candidate_id": "e6edc8bb-...",
+#   "questions": [
+#     {
+#       "question":  "You shipped two 2D titles — how would you approach your first 3D project here?",
+#       "solve":     "3D Readiness",
+#       "recommend": "Recommended for: Technical Lead Round"
+#     },
+#     {
+#       "question":  "Walk me through a time you had to push back on a product decision that affected engineering scope.",
+#       "solve":     "Cross-functional Friction",
+#       "recommend": "Recommended for: Hiring Manager Round"
+#     },
+#     {
+#       "question":  "The team pairs heavily on live-ops. Describe your experience shipping code against unclear ownership boundaries.",
+#       "solve":     "Ambiguity Handling",
+#       "recommend": "Recommended for: Peer Interview"
+#     }
+#   ]
+# }
+#
+# Each call produces a fresh set — existing questions are passed to Gemini
+# as a "do not repeat" list and temperature is bumped (0.6) to force
+# variety from the original generation (0.2).
+
+# ── Error: no AI review to regenerate from ────────────────────────────────────
+# Happens when cv_ai_reviews has no row for this candidate yet (the original
+# review either failed or was never scheduled). Fix: call /review/retry
+# first, then regenerate.
+curl -s -X POST "http://localhost:8080/api/v1/candidates/<id-no-review>/review/questions/regenerate" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 409 { "error": { "code": "NO_REVIEW", "message": "no AI review to regenerate questions from — call /review/retry first" } }
+
+# ── Error: Gemini not configured ──────────────────────────────────────────────
+# → 503 { "error": { "code": "AI_NOT_CONFIGURED", "message": "AI service is not configured" } }
+
+# ── Error: bad UUID ───────────────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/candidates/not-a-uuid/review/questions/regenerate" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 400 { "error": { "code": "INVALID_ID", "message": "invalid candidate ID" } }
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s -X POST "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/review/questions/regenerate" | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ── How it differs from /review/retry ────────────────────────────────────────
+# /review/retry                       : re-runs the WHOLE review (score,
+#                                       strengths, gaps, questions). Async 202.
+#                                       Use when ai_reviews is null.
+# /review/questions/regenerate        : keeps everything except the questions;
+#                                       swaps the 3 questions for fresh ones.
+#                                       Sync 200. Use when the HR user wants
+#                                       to see different interview angles
+#                                       without losing the score/analysis.

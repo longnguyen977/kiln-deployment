@@ -1,0 +1,191 @@
+# Candidate Profile
+# GET /api/v1/candidates/:id       — full profile with AI analytics
+# GET /api/v1/candidates/:id/cv    — stream the candidate's latest CV for inline preview
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+CANDIDATE_ID="<uuid from candidates list>"
+
+# ── GET /api/v1/candidates/:id ────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (200 OK):
+# {
+#   "data": {
+#     "id":                "uuid",
+#     "full_name":         "Elena Rodriguez",
+#     "role":              "Principal Designer at FinTech Corp",
+#     "experience":        "8+ Years Exp",
+#     "proficiency_level": "principal",
+#     "email":             "elena@fintechcorp.com",
+#     "phone":             "+1 555 234 5678",
+#     "location":          "Ho Chi Minh City, Vietnam",
+#     "linkedin_url":      "https://linkedin.com/in/elena-rodriguez",
+#     "stage":             "interviewing",
+#     "stage_label":       "Interviewing",
+#     "top_skills":        ["Figma", "Design Systems", "User Research"],
+#     "cv_url":            "/api/v1/candidates/uuid/cv",
+#     "ai_review": {
+#       "id":                "uuid",
+#       "team_id":           "uuid",
+#       "role_title":        "Lead Designer",
+#       "department":        "Design",
+#       "team":              "Lead Designer",
+#       "proficiency_level": "principal",
+#       "date_posted":       "2026-04-16",
+#       "match_score":       91,
+#       "analytics_text":    "Ranked #1 out of 8 in the Lead Designer pool — top 100% of applicants",
+#       "key_strengths": [
+#         { "title": "Product Design Leadership", "description": "7+ years leading design systems at scale across mobile and web." },
+#         { "title": "Cross-functional Collaboration", "description": "Proven experience partnering with engineering and product across FinTech." },
+#         { "title": "User Research Depth", "description": "Conducts and synthesises qualitative + quantitative research to inform design decisions." }
+#       ],
+#       "potential_gaps": [
+#         { "title": "AR/VR Experience",      "description": "No mention of AR or VR prototyping, listed as a nice-to-have for this role." },
+#         { "title": "B2B SaaS Focus",        "description": "Background is primarily consumer-facing; role targets enterprise B2B users." },
+#         { "title": "Design System Tooling", "description": "No explicit mention of Tokens Studio or Style Dictionary." }
+#       ],
+#       "suggested_interview_questions": [
+#         {
+#           "question":        "Walk me through a design decision where you had to push back on stakeholder requirements — what was the outcome?",
+#           "category":        "Stakeholder Management",
+#           "recommended_for": "Hiring Manager Round"
+#         },
+#         {
+#           "question":        "How have you balanced aesthetic quality with velocity when shipping under tight deadlines at FinTech Corp?",
+#           "category":        "Technical Depth",
+#           "recommended_for": "Technical Lead Round"
+#         },
+#         {
+#           "question":        "Describe how you onboard junior designers onto a design system you own.",
+#           "category":        "Leadership",
+#           "recommended_for": "Peer Interview"
+#         }
+#       ]
+#     },
+#     "stage_history": [
+#       {
+#         "id":              "uuid",
+#         "stage":           "interviewing",
+#         "stage_label":     "Interviewing",
+#         "changed_at":      "2026-04-16T10:00:00Z",
+#         "changed_by_name": "Alice Nguyen",
+#         "note":            "Moved to interviewing round"
+#       },
+#       {
+#         "id":              "uuid",
+#         "stage":           "screened",
+#         "stage_label":     "Screened",
+#         "changed_at":      "2026-04-15T08:30:00Z",
+#         "changed_by_name": null,
+#         "note":            null
+#       }
+#     ],
+#     "skill_compare": {
+#       "position_id":         "b7d3...",
+#       "position_title":      "Backend Developer (Golang)",
+#       "candidate_id":        "uuid",
+#       "candidate_full_name": "Sarah Mitchell",
+#       "skills": [
+#         {
+#           "skill_id":              "...",
+#           "skill":                 "Golang",
+#           "requirement":           "required",
+#           "job_proficiency":       "senior",
+#           "job_years_min":         3,
+#           "candidate_has":         true,
+#           "candidate_proficiency": "senior",
+#           "candidate_years":       5.0,
+#           "matches":               true,
+#           "exceeds":               false
+#         },
+#         {
+#           "skill_id":              "...",
+#           "skill":                 "Kubernetes",
+#           "requirement":           "required",
+#           "job_proficiency":       "junior",
+#           "job_years_min":         0,
+#           "candidate_has":         false,
+#           "matches":               false,
+#           "exceeds":               false
+#         },
+#         {
+#           "skill_id":              "...",
+#           "skill":                 "gRPC",
+#           "requirement":           "nice_to_have",
+#           "job_proficiency":       "",
+#           "job_years_min":         0,
+#           "candidate_has":         true,
+#           "candidate_proficiency": "middle",
+#           "candidate_years":       1.5,
+#           "matches":               true,
+#           "exceeds":               false
+#         }
+#       ],
+#       "summary": {
+#         "total_required":       2,
+#         "total_nice_to_have":   1,
+#         "matched_required":     1,
+#         "matched_nice_to_have": 1,
+#         "missing_required":     1,
+#         "missing_nice_to_have": 0
+#       }
+#     }
+#   }
+# }
+
+# Response (200 OK) — no AI review yet (processing still running):
+# {
+#   "data": {
+#     "id":        "uuid",
+#     "full_name": "Sarah Mitchell",
+#     "role":      "Backend Engineer at TechCorp",
+#     "experience": "5+ Years Exp",
+#     ...
+#     "ai_review": null
+#   }
+# }
+
+# ── GET /api/v1/candidates/:id/cv — stream CV for inline preview ──────────────
+# Returns the PDF/DOCX file directly. Content-Disposition: inline
+# Use in frontend as: <iframe src="/api/v1/candidates/uuid/cv?token=..." />
+
+curl -s "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/cv" \
+  -H "Authorization: Bearer $TOKEN" \
+  -o preview.pdf && open preview.pdf
+
+# Response: binary PDF or DOCX stream
+# Content-Type: application/pdf  (or application/vnd.openxmlformats-officedocument...)
+# Content-Disposition: inline
+
+# ── Error: candidate not found ────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/candidates/00000000-0000-0000-0000-000000000000" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "NOT_FOUND", "message": "candidate not found" } }
+
+# ── Error: no CV on file ──────────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/cv" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "NO_CV", "message": "no CV on file" } }
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# experience    : computed from total_experience_months — "X+ Years Exp" or "< 1 Year Exp"
+# location      : built from JSONB {city, country} — "Ho Chi Minh City, Vietnam"
+# cv_url        : null if no CV uploaded yet
+# ai_review     : null if AI processing hasn't completed yet
+# analytics_text: "Ranked #N out of M in the {pool} pool — top X% of applicants"
+# stage_history : audit trail of all pipeline transitions (newest first)
+# skill_compare : null when the candidate has no matched position yet, OR
+#                 the matched position has no rows in job_position_skills
+#                 (legacy JDs confirmed before migration 96 — re-confirm to
+#                 populate). Otherwise an object with the full job ↔
+#                 candidate skill table. Same shape as the standalone
+#                 GET /api/v1/candidates/:id/skill-compare endpoint — both
+#                 are server-rendered from the same helper.
+# stage values  : screened | interview_scheduled | interviewing | interview_done
+#                 offer_sent | offer_accepted | offer_rejected | onboarding | hired | rejected

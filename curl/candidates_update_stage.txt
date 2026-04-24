@@ -1,0 +1,113 @@
+# Candidates — Update Stage
+# PATCH /api/v1/candidates/:id/stage   — move candidate to a new pipeline stage
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+CANDIDATE_ID="<uuid from candidates list>"
+
+# ── PATCH /api/v1/candidates/:id/stage — advance to interview_scheduled ───────
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"interview_scheduled","note":"Scheduled phone screen for next Monday"}' | jq .
+
+# ── PATCH — move to interviewing ──────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"interviewing"}' | jq .
+
+# ── PATCH — move to interview_done ────────────────────────────────────────────
+# SIDE EFFECT: every interview row for this candidate with status='scheduled'
+# is soft-cancelled (status → 'cancelled', notes gets a marker line).
+# Completed / cancelled / no_show rows are left intact — they are the audit
+# trail of what actually happened. The soft-cancel also removes pending
+# interviews from interviewer calendars and prevents the auto-advance
+# worker from seeing them as "live".
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"interview_done","note":"Final round wrapped — waiting on panel debrief"}' | jq .
+
+# ── PATCH — reject candidate ─────────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"rejected","note":"Does not meet minimum experience requirements"}' | jq .
+
+# ── PATCH — send offer ────────────────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"offer_sent","note":"Sent offer letter via email"}' | jq .
+
+# ── PATCH — candidate accepted offer ─────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"offer_accepted"}' | jq .
+
+# Response (200 OK) — returns full candidate profile with updated stage + history:
+# {
+#   "data": {
+#     "id":          "uuid",
+#     "full_name":   "Elena Rodriguez",
+#     "role":        "Principal Designer at FinTech Corp",
+#     "experience":  "8+ Years Exp",
+#     "stage":       "rejected",
+#     "stage_label": "Rejected",
+#     "stage_history": [
+#       {
+#         "id":              "uuid",
+#         "stage":           "rejected",
+#         "stage_label":     "Rejected",
+#         "changed_at":      "2026-04-16T15:30:00Z",
+#         "changed_by_name": "Alice Nguyen",
+#         "note":            "Does not meet minimum experience requirements"
+#       },
+#       {
+#         "id":              "uuid",
+#         "stage":           "screened",
+#         "stage_label":     "Screened",
+#         "changed_at":      "2026-04-15T10:00:00Z",
+#         "changed_by_name": null,
+#         "note":            null
+#       }
+#     ],
+#     ...
+#   }
+# }
+
+# ── Available stages ──────────────────────────────────────────────────────────
+#  1  screened            — right after AI extracts data
+#  2  interview_scheduled — HR scheduled an interview
+#  3  interviewing        — candidate is interviewing
+#  4  interview_done      — interview finished
+#  5  offer_sent          — offer sent to candidate
+#  6  offer_accepted      — candidate accepted the offer
+#  7  offer_rejected      — candidate rejected the offer
+#  8  onboarding          — candidate is onboarding
+#  9  hired               — candidate has been hired
+# 10  rejected            — rejected by HR
+
+# ── Request body ──────────────────────────────────────────────────────────────
+# stage  (required) — stage code from the list above
+# note   (optional) — free-text reason for the transition
+
+# ── Error: missing stage ──────────────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/$CANDIDATE_ID/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq .
+# → 400 { "error": { "code": "MISSING_STAGE", "message": "stage is required" } }
+
+# ── Error: invalid candidate ID ───────────────────────────────────────────────
+curl -s -X PATCH "http://localhost:8080/api/v1/candidates/not-a-uuid/stage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"rejected"}' | jq .
+# → 400 { "error": { "code": "INVALID_ID", "message": "invalid candidate ID" } }

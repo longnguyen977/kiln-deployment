@@ -1,0 +1,121 @@
+# Integrations API — /api/v1/integrations
+# All routes except the Gmail callback require a valid Bearer token.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/integrations — all sources with org connection status ─────────
+curl -s http://localhost:8080/api/v1/integrations \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Each entry looks like:
+# {
+#   "source_id": "...",
+#   "code": "gmail",
+#   "name": "Gmail",
+#   "type": "email",
+#   "icon_url": "...",
+#   "connected": false,
+#   "connected_account": null,
+#   "sync_status": null,
+#   "last_sync_at": null,
+#   "error_message": null,
+#   "connected_at": null
+# }
+
+# ── GET /api/v1/integrations/:code — single source ────────────────────────────
+curl -s http://localhost:8080/api/v1/integrations/gmail \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── Gmail OAuth — initiate popup ──────────────────────────────────────────────
+# Open this URL in a browser (or have the frontend open it as a popup).
+# The backend will redirect to Google's consent page requesting:
+#   - userinfo.email
+#   - gmail.readonly
+#   - gmail.send
+#
+# Prerequisites (Google Cloud Console):
+#   1. Enable "Gmail API" on the project.
+#   2. Add http://localhost:8080/api/v1/integrations/gmail/callback
+#      to OAuth 2.0 → Authorized redirect URIs.
+#
+# GET http://localhost:8080/api/v1/integrations/gmail/connect
+#   Authorization: Bearer <token>
+#
+# curl equivalent (will follow redirects):
+curl -s -L -c /tmp/cookies.txt \
+  -H "Authorization: Bearer $TOKEN" \
+  -o /dev/null -w "%{redirect_url}\n" \
+  http://localhost:8080/api/v1/integrations/gmail/connect
+
+# ── Gmail callback (handled automatically by browser / Google) ────────────────
+# Google redirects to:
+#   GET http://localhost:8080/api/v1/integrations/gmail/callback?code=...&state=...
+#
+# On success: backend saves tokens and redirects to:
+#   http://localhost:3000/integrations?connected=gmail
+#
+# The callback also triggers a background Gmail import automatically:
+#   - Scans inbox for CV emails (up to 200 messages)
+#   - Enqueues each CV attachment for AI processing (pool matching + candidate extraction)
+#   - Each attachment appears as an entry in GET /api/v1/candidates/upload-queue
+#     with submitted_via = "gmail" (lowercase — matches cv_sources.code)
+#
+# After connect, the integration will show:
+# {
+#   "code": "gmail",
+#   "connected": true,
+#   "connected_account": "user@gmail.com",
+#   "sync_status": "idle",
+#   "connected_at": "2026-04-14T20:00:00Z"
+# }
+
+# ── DELETE /api/v1/integrations/:code — disconnect ────────────────────────────
+curl -s -X DELETE http://localhost:8080/api/v1/integrations/gmail \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── POST /api/v1/integrations/gmail/scan — preview CV emails (no import) ──────
+# PREVIEW ONLY — returns matched CV emails but does NOT enqueue them for AI processing.
+# Use this to preview what the Gmail import would pick up before connecting.
+# To trigger actual import: go through the OAuth connect flow (/gmail/connect).
+#
+# Requires Gmail to be connected first.
+# Query param: limit=100 (default, max 500)
+curl -s -X POST "http://localhost:8080/api/v1/integrations/gmail/scan?limit=50" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Console output for each match (printed in real time by the server):
+# ╔══ [MATCH 1/34] ═══════════════════════════════════════════════════
+# ║  From    : John Smith <john.smith@gmail.com>
+# ║  Subject : Application for Senior Backend Engineer
+# ║  Date    : Mon, 14 Apr 2026 15:30:00 +0700
+# ║  Files   : John_Smith_CV.pdf
+# ║  Score   : 5/5  reasons: subject contains 'application' | cv attachment: John_Smith_CV.pdf | body 843 chars
+# ║  Snippet : Dear Hiring Manager, I am writing to apply for the Senior Backend…
+# ╚═══════════════════════════════════════════════════════════════════
+#
+# API response:
+# {
+#   "data": {
+#     "scanned": 50,
+#     "matched": 12,
+#     "emails": [ { "from": "...", "subject": "...", "attachments": [...], ... } ]
+#   }
+# }
+
+# ── Check import status after Gmail connect ───────────────────────────────────
+# After OAuth connect, imported CVs appear in the processing queue:
+curl -s http://localhost:8080/api/v1/candidates/upload-queue \
+  -H "Authorization: Bearer $TOKEN" | jq '.data[] | select(.submitted_via == "gmail")'
+
+# ── Generic connect (non-OAuth — e.g. LinkedIn Recruiter API key) ─────────────
+curl -s -X POST http://localhost:8080/api/v1/integrations/linkedin_recruiter/connect \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "credentials": { "api_key": "li_api_key_here" },
+    "config":      {}
+  }' | jq .

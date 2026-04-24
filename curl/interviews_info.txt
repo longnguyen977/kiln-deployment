@@ -1,0 +1,130 @@
+# Interviews — Info (+ AI invitation email)
+# GET /api/v1/interviews/:id/info
+#
+# Enriched view of a single interview. Returns everything /interviews/:id
+# returns, PLUS:
+#   - candidate_full_name  (candidates.full_name)
+#   - candidate_email      (candidates.canonical_email)
+#   - email_draft          (AI-generated subject + body for the invitation)
+#
+# The email draft is written to the new table interview_ai_email_drafts by
+# a background goroutine fired from POST /api/v1/interviews. Gemini call
+# takes a couple of seconds; until it lands, email_draft.status returns
+# "generating" and subject/body are empty strings. Poll /info (or just
+# refresh the page) to pick up the draft when it arrives.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── 1. Schedule an interview ──────────────────────────────────────────────────
+INTERVIEW_ID=$(curl -s -X POST http://localhost:8080/api/v1/interviews \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "candidate_id":     "e6edc8bb-f671-45ff-bdc1-45cdb384db49",
+    "type":             "video",
+    "scheduled_at":     "2026-04-23T14:00:00+07:00",
+    "duration_minutes": 45,
+    "location":         "Google Meet — link to follow",
+    "interviewer_ids":  ["<hiring-manager-uuid>"],
+    "notes":            "Tech screen — focus on Unity + C#"
+  }' | jq -r '.data.id')
+
+# 201 Created — side effects:
+#   • candidate stage → interview_scheduled + candidate_stage_history row
+#   • background goroutine asks Gemini to draft the invitation email
+
+# ── 2. GET /api/v1/interviews/:id/info ───────────────────────────────────────
+# By default returns immediately with whatever state the DB has right now —
+# "generating" / "ready" / "sent".
+curl -s "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/info" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# ── 2b. Long-polling variant: ?wait=<seconds>  (max 60) ──────────────────────
+# The server blocks up to `wait` seconds, polling internally every 500ms
+# until email_draft.status becomes "ready" (or "sent"). If the window
+# elapses first, the current state is returned so the client can re-poll.
+#
+# Use case: the UI that just scheduled an interview can call /info?wait=45
+# and get the finished draft in one round-trip instead of polling every
+# few seconds itself.
+#
+# Typical Gemini latency is ~10–25s, so wait=30–45 covers the common case.
+# Cap is 60s to stay under typical reverse-proxy read timeouts.
+curl -s --max-time 65 \
+  "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/info?wait=45" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Expected response (200 OK) — draft ready:
+# {
+#   "data": {
+#     "id":                "b7d3…",
+#     "candidate_id":      "e6edc8bb-…",
+#     "candidate_full_name": "Bùi Minh Vũ",
+#     "candidate_email":     "minhvu@example.com",
+#     "type":              "video",
+#     "scheduled_at":      "2026-04-23T14:00:00+07:00",
+#     "duration_minutes":  45,
+#     "location":          "Google Meet — link to follow",
+#     "interviewer_ids":   ["…"],
+#     "status":            "scheduled",
+#     "candidate_confirmed": false,
+#     "outcome":           "",
+#     "calendar_event_id": "",
+#     "created_by":        "…",
+#     "created_at":        "…",
+#     "updated_at":        "…",
+#     "email_draft": {
+#       "status":     "ready",
+#       "subject":    "Interview Invitation — Unity Developer at Acme",
+#       "body":       "Hi Vũ,\n\nThanks for applying to Acme. We'd love to invite you to a 45-minute video interview on Thursday, 23 April 2026 at 14:00 ICT. We'll send a Google Meet link closer to the date.\n\nPlease reply to confirm you can make it, or let us know if another time works better.\n\nLooking forward to speaking with you.",
+#       "updated_at": "2026-04-22T10:02:07Z"
+#     }
+#   }
+# }
+
+# ── Expected response (200 OK) — draft still generating: ─────────────────────
+# {
+#   "data": {
+#     ...same fields as above...,
+#     "email_draft": {
+#       "status":  "generating",
+#       "subject": "",
+#       "body":    ""
+#     }
+#   }
+# }
+#
+# This just means the background goroutine hasn't finished yet. A few
+# hundred ms to a few seconds typically; re-fetch /info to pick up the
+# completed draft — or call /info?wait=45 which blocks server-side until
+# the draft lands (or the wait window elapses).
+#
+# Failures are logged server-side — if the status stays "generating" even
+# after a wait=60 long poll, check API logs for "gemini email draft
+# failed" under logger "interviews.email_draft".
+
+# ── Error: interview not found ───────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/interviews/00000000-0000-0000-0000-000000000000/info \
+  -H "Authorization: Bearer $TOKEN" | jq .
+# → 404 { "error": { "code": "NOT_FOUND", "message": "interview not found" } }
+
+# ── Error: unauthenticated ───────────────────────────────────────────────────
+curl -s "http://localhost:8080/api/v1/interviews/$INTERVIEW_ID/info" | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# - Subject/body language matches cv_extractions.extracted_data->>'language'
+#   when the candidate has a parsed CV on file ("vi" → Vietnamese, anything
+#   else → English). For candidates without a CV extraction yet, defaults
+#   to English.
+# - Regenerating the draft via a /info endpoint isn't implemented yet — a
+#   future /interviews/:id/email/regenerate would re-run the goroutine.
+#   For now, the simplest workaround is to /reschedule the interview; the
+#   re-scheduled flow will trigger a fresh draft (when that path is wired).
+# - The interview_ai_email_drafts row is ONE per interview (UNIQUE on
+#   interview_id). Rescheduling or regenerating upserts the same row — no
+#   duplicate drafts accumulate.

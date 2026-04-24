@@ -1,0 +1,135 @@
+# JD Confirm → ReactFlow reconciliation — /api/v1/jd/confirm/flow
+#
+# Same write-path as /api/v1/jd/confirm — creates job_positions + job_descriptions,
+# upserts the department / team, generates the PDF, flips the draft to
+# confirmed, and fires a background RematchUnmatchedCVs.
+#
+# Extra: returns a `flow` delta that tells the frontend exactly which preview
+# nodes/edges (emitted earlier by /jd/extract/flow) to remove and which
+# permanent nodes/edges to add. After applying it, the org chart reflects the
+# persisted Department → Team → Position path with their real DB UUIDs.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── 1. Grab a draft from /jd/extract/flow ─────────────────────────────────────
+EXTRACT=$(curl -s -X POST http://localhost:8080/api/v1/jd/extract/flow \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "BACK-END DEVELOPER (GOLANG) – Engineering / Backend Engineer – 1,000–1,800 USD – TP.HCM"
+  }')
+DRAFT_ID=$(echo "$EXTRACT" | jq -r '.id')
+
+# ── 2. POST /api/v1/jd/confirm/flow ──────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm/flow \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"draft_id\": \"$DRAFT_ID\",
+    \"title\": \"BACK-END DEVELOPER (GOLANG)\",
+    \"department\": \"Engineering\",
+    \"team\": \"Backend Engineer\",
+    \"location\": \"Quận 3, TP.HCM\",
+    \"location_type\": \"onsite\",
+    \"employment_type\": \"full_time\",
+    \"salary_min\": 1000,
+    \"salary_max\": 1800,
+    \"salary_text\": \"1,000 – 1,800 USD/month\",
+    \"currency\": \"USD\",
+    \"proficiency_level\": \"middle\",
+    \"language\": \"vi\",
+    \"role_overview\": \"Vai trò này tập trung vào việc xây dựng backend cho các game online và HTML5 sử dụng Golang.\",
+    \"requirements\":    [\"2+ năm kinh nghiệm Backend\"],
+    \"responsibilities\":[\"Xây dựng backend\"],
+    \"nice_to_have\":    [\"Kafka\"],
+    \"benefits\":        [\"Lương cạnh tranh\"],
+    \"skills_required\": [\"Golang\",\"PostgreSQL\"],
+    \"application_email\": \"hr@company.com\"
+  }" | jq .
+
+# Expected response (201 Created):
+# {
+#   "position_id":    "b7d3...-real",
+#   "description_id": "a2f1...-real",
+#   "pdf_file_id":    "c8e4...",
+#   "pdf_path":       "org-id/jd/b7d3-real_back-end-developer-golang.pdf",
+#   "flow": {
+#     "draft_id": "3f2e1d4c-...",
+#     "remove_node_ids": [
+#       "dept-draft-3f2e1d4c-...",
+#       "team-draft-3f2e1d4c-...",
+#       "pos-draft-3f2e1d4c-..."
+#     ],
+#     "remove_edge_ids": [
+#       "e-org-<orgID>-dept-draft-3f2e1d4c-...",
+#       "e-dept-draft-3f2e1d4c-...-team-draft-3f2e1d4c-...",
+#       "e-dept-<realDeptID>-team-draft-3f2e1d4c-...",
+#       "e-team-draft-3f2e1d4c-...-pos-draft-3f2e1d4c-...",
+#       "e-team-<realTeamID>-pos-draft-3f2e1d4c-..."
+#     ],
+#     "nodes": [
+#       {
+#         "id":   "dept-<realDeptID>",
+#         "type": "department",
+#         "position": { "x": 0, "y": 160 },
+#         "data": { "label": "Engineering", "kind": "department" },
+#         "draggable": false, "selectable": true, "connectable": false, "deletable": false
+#       },
+#       {
+#         "id":   "team-<realTeamID>",
+#         "type": "team",
+#         "position": { "x": 0, "y": 320 },
+#         "data": { "label": "Backend Engineer", "kind": "team" },
+#         ...
+#       },
+#       {
+#         "id":   "pos-<realPositionID>",
+#         "type": "position",
+#         "position": { "x": 0, "y": 480 },
+#         "data": {
+#           "label":             "BACK-END DEVELOPER (GOLANG)",
+#           "kind":              "position",
+#           "proficiency_level": "middle",
+#           "status":            "open",
+#           "headcount":         "1"
+#         },
+#         ...
+#       }
+#     ],
+#     "edges": [
+#       { "id": "e-org-<orgID>-dept-<realDeptID>",   "source": "org-<orgID>",         "target": "dept-<realDeptID>" },
+#       { "id": "e-dept-<realDeptID>-team-<realTeamID>", "source": "dept-<realDeptID>", "target": "team-<realTeamID>" },
+#       { "id": "e-team-<realTeamID>-pos-<realPositionID>", "source": "team-<realTeamID>", "target": "pos-<realPositionID>" }
+#     ]
+#   }
+# }
+
+# ── Frontend reconciliation pattern ───────────────────────────────────────────
+# const { flow, position_id } = await fetch("/api/v1/jd/confirm/flow", { … }).then(r => r.json());
+# setNodes(prev =>
+#   prev.filter(n => !flow.remove_node_ids.includes(n.id)).concat(flow.nodes)
+# );
+# setEdges(prev =>
+#   prev.filter(e => !flow.remove_edge_ids.includes(e.id)).concat(flow.edges)
+# );
+#
+# Preview nodes from /jd/extract/flow always include `data.draft_id`; using the
+# remove_node_ids list is the explicit contract, but filtering by
+# `n.data?.draft_id === flow.draft_id` works too.
+
+# ── Idempotency / errors ──────────────────────────────────────────────────────
+# Same semantics as /jd/confirm:
+# → 404 DRAFT_NOT_FOUND          if the draft id is unknown or belongs to another org
+# → 409 DRAFT_ALREADY_CONFIRMED  if the draft was already confirmed/discarded
+# → 400 MISSING_DATA             if title or JD body is missing
+# → 400 INVALID_DRAFT_ID         if draft_id is not a valid UUID
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm/flow \
+  -H "Content-Type: application/json" \
+  -d "{\"draft_id\": \"$DRAFT_ID\", \"title\": \"x\"}" | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }

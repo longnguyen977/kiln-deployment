@@ -1,0 +1,146 @@
+# JD Extraction API — /api/v1/jd/extract
+# Sends raw job description text to Gemini 2.5 Pro, saves a draft, and returns
+# a structured preview. The user confirms later to persist to job_positions + job_descriptions.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── POST /api/v1/jd/extract — extract from raw text ──────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Tuyển Golang Developer (Junior) – Lương upto 20M\nYêu cầu:\n~2 năm kinh nghiệm backend (ưu tiên Golang)\nBiết REST API, DB (MySQL/Postgres), Git\nQuyền lợi:\nLương upto 20M\nĐầy đủ chế độ theo luật\nGửi CV: hr@company.vn Tiêu đề: Golang – Họ tên"
+  }' | jq .
+
+# Expected response — raw AI output + server-computed fields:
+# {
+#   "id": "3f2e1d4c-...",                   ← draft UUID (send this to confirm/save later)
+#   "how_to_apply": "Email: hr@company.vn | Subject: CV – Golang – Họ tên",
+#   "title": "Golang Developer (Junior)",
+#   "department": "Engineering",            ← top-level department inferred from JD
+#   "team": "Backend Engineer",             ← sub-team / pool within the department
+#   "location": "Hà Nội",
+#   "location_type": "onsite",
+#   "employment_type": "full_time",
+#   "salary_min": 0,
+#   "salary_max": 20,
+#   "salary_text": "Upto 20M",
+#   "currency": "VND",
+#   "seniority_level": "junior",
+#   "language": "vi",
+#   "role_overview": "Chúng tôi tìm kiếm Golang Developer junior...",
+#   "requirements": [
+#     "Required Skills: Golang, REST API, MySQL, PostgreSQL, Git",
+#     "~2 năm kinh nghiệm backend"
+#   ],
+#   "responsibilities": ["Xây dựng REST API", "Tối ưu hóa database queries"],
+#   "nice_to_have": [],
+#   "benefits": ["Lương upto 20M", "Đầy đủ chế độ theo luật"],
+#   "skills_required": ["Golang", "REST API", "MySQL", "PostgreSQL", "Git"],
+#   "application_email": "hr@company.vn",
+#   "application_phone": "",
+#   "application_note": "Tiêu đề: Golang – Họ tên"
+# }
+
+# ── English JD example ────────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Job Title: Golang Developer\nLocation: Nigeria\nStrong proficiency in Golang required.\nDesign and maintain backend services. Collaborate with cross-functional teams.\nRequired: 3+ years Go experience, RESTful APIs, Docker, PostgreSQL.\nApply: careers@company.com"
+  }' | jq .
+
+# ── Vietnamese JD with salary range ───────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "JAVA DEVELOPER – TP.HCM\nMức lương: 25M – 27M Gross\nĐịa điểm: Hybrid Q.7\nYêu cầu: 4 năm Java, SQL+Cloud, Store Procedure, K8S là lợi thế, tiếng Anh đọc hiểu\nQuyền lợi: BHXH full, review lương 2 lần/năm, thưởng tháng 13\nLiên hệ: ☎ 0903 874 592 (Zalo) 📧 thypnm1@tinhvan.com"
+  }' | jq .
+
+# Expected salary_range: { "lowest": 25, "upto": 27 }
+
+# ── Error: missing text ───────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": ""}' | jq .
+# → 400 { "error": { "code": "EMPTY_TEXT", "message": "text is required" } }
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/extract \
+  -H "Content-Type: application/json" \
+  -d '{"text": "some jd"}' | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/v1/jd/confirm
+# Saves the (possibly user-edited) draft to job_positions + job_descriptions,
+# generates a structured PDF, stores it locally, marks the draft confirmed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Minimal confirm (use draft_id from /extract response) ────────────────────
+DRAFT_ID="paste-draft-id-here"
+
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"draft_id\": \"$DRAFT_ID\",
+    \"title\": \"BACK-END DEVELOPER (GOLANG)\",
+    \"department\": \"Engineering\",
+    \"team\": \"Backend Engineer\",
+    \"location\": \"Quận 3, TP.HCM\",
+    \"location_type\": \"onsite\",
+    \"employment_type\": \"full_time\",
+    \"salary_min\": 1000,
+    \"salary_max\": 1800,
+    \"salary_text\": \"1,000 – 1,800 USD/month\",
+    \"currency\": \"USD\",
+    \"seniority_level\": \"mid\",
+    \"language\": \"vi\",
+    \"role_overview\": \"Vai trò này tập trung vào việc xây dựng backend cho các game online và HTML5 sử dụng Golang.\",
+    \"requirements\": [
+      \"Required Skills: Golang, REST API, SQL, NoSQL, Cloud (AWS, Azure, GCP), CI/CD\",
+      \"2+ năm kinh nghiệm Backend / Software Engineering\",
+      \"Tiếng Anh làm việc tốt\"
+    ],
+    \"responsibilities\": [
+      \"Xây dựng backend cho online & HTML5 games\",
+      \"Design & optimize RESTful APIs\",
+      \"Tham gia design system architecture\"
+    ],
+    \"nice_to_have\": [\"Kinh nghiệm Microservices, Kafka, CQRS\", \"Đam mê game\"],
+    \"benefits\": [\"Lương cạnh tranh + deal theo năng lực\", \"Làm việc với team quốc tế (Singapore)\"],
+    \"skills_required\": [\"Golang\", \"REST API\", \"SQL\", \"NoSQL\", \"AWS\", \"GCP\", \"Azure\", \"CI/CD\"],
+    \"application_email\": \"lethitamhr@gmail.com\",
+    \"application_phone\": \"\",
+    \"application_note\": \"Inbox hoặc comment để nhận JD chi tiết!\"
+  }" | jq .
+
+# Expected response (201 Created):
+# {
+#   "position_id":    "uuid",          ← created job_positions row
+#   "description_id": "uuid",          ← created job_descriptions row
+#   "pdf_file_id":    "uuid",          ← file_objects row for the PDF
+#   "pdf_path":       "org-id/jd/position-id_back-end-developer-golang.pdf"
+# }
+
+# ── Error: draft already confirmed ───────────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"draft_id\": \"$DRAFT_ID\", \"title\": \"Test\"}" | jq .
+# → 409 { "error": { "code": "DRAFT_ALREADY_CONFIRMED", ... } }
+
+# ── Error: draft not found / wrong org ───────────────────────────────────────
+curl -s -X POST http://localhost:8080/api/v1/jd/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"draft_id": "00000000-0000-0000-0000-000000000000", "title": "x"}' | jq .
+# → 404 { "error": { "code": "DRAFT_NOT_FOUND", ... } }

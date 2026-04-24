@@ -1,0 +1,133 @@
+# Organization — Structure (ReactFlow chart)
+# GET /api/v1/organization/structure
+#
+# Returns a read-only React Flow graph of the caller's organization:
+#   Organization → Department → Team → Position → Candidate (AI-matched CV)
+#
+# Candidate nodes are emitted as circles (data.shape = "circle") and are
+# attached under the position their CV was matched to.
+#
+# The JSON shape matches React Flow's initialNodes / initialEdges literal —
+# drop it straight into useNodesState / useEdgesState on the frontend.
+#
+# Nodes are emitted with draggable=false, connectable=false, deletable=false
+# so the chart is strictly a view. The frontend should not allow edits.
+
+# ── Get a token first ─────────────────────────────────────────────────────────
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret"}' \
+  | jq -r '.data.access_token')
+
+# ── GET /api/v1/organization/structure ────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/organization/structure \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Response (200 OK):
+# {
+#   "nodes": [
+#     {
+#       "id":          "org-0f8e5e08-...",
+#       "type":        "organization",
+#       "position":    { "x": 440, "y": 0 },
+#       "data":        { "label": "Acme Inc.", "kind": "organization" },
+#       "draggable":   false,
+#       "selectable":  true,
+#       "connectable": false,
+#       "deletable":   false
+#     },
+#     {
+#       "id":          "dept-5d3a...",
+#       "type":        "department",
+#       "position":    { "x": 220, "y": 160 },
+#       "data":        { "label": "Engineering", "kind": "department" },
+#       "draggable":   false,
+#       "selectable":  true,
+#       "connectable": false,
+#       "deletable":   false
+#     },
+#     {
+#       "id":          "team-7f91...",
+#       "type":        "team",
+#       "position":    { "x": 110, "y": 320 },
+#       "data":        { "label": "Mobile Engineer", "kind": "team" },
+#       ...
+#     },
+#     {
+#       "id":          "pos-b42c...",
+#       "type":        "position",
+#       "position":    { "x": 0, "y": 480 },
+#       "data": {
+#         "label":             "Senior Unity Developer",
+#         "kind":              "position",
+#         "headcount":         "2",
+#         "status":            "open",
+#         "proficiency_level": "senior"
+#       },
+#       "draggable":   false,
+#       "selectable":  true,
+#       "connectable": false,
+#       "deletable":   false
+#     },
+#     {
+#       "id":          "cand-e6edc8bb-...",
+#       "type":        "candidate",
+#       "position":    { "x": 0, "y": 640 },
+#       "data": {
+#         "label":       "Bùi Minh Vũ",
+#         "kind":        "candidate",
+#         "shape":       "circle",
+#         "match_score": "87",
+#         "cv_id":       "2d8f7a10-..."
+#       },
+#       "draggable":   false,
+#       "selectable":  true,
+#       "connectable": false,
+#       "deletable":   false
+#     }
+#   ],
+#   "edges": [
+#     {
+#       "id":       "e-org-0f8e5e08-...-dept-5d3a...",
+#       "source":   "org-0f8e5e08-...",
+#       "target":   "dept-5d3a...",
+#       "animated": false
+#     },
+#     {
+#       "id":       "e-dept-5d3a...-team-7f91...",
+#       "source":   "dept-5d3a...",
+#       "target":   "team-7f91...",
+#       "animated": false
+#     }
+#   ]
+# }
+
+# ── Node id prefixes ──────────────────────────────────────────────────────────
+# org-<uuid>     — the organization (exactly one)
+# dept-<uuid>    — a department
+# team-<uuid>    — a team inside a department
+# pos-<uuid>     — a live job position inside a team
+#                   (positions with status draft/closed are excluded)
+# cand-<uuid>    — a candidate whose CV the AI matched to this position
+
+# ── Node types ────────────────────────────────────────────────────────────────
+# Use `type` to render different React Flow custom node components:
+#   organization → big rounded card
+#   department   → medium card
+#   team         → small card
+#   position     → compact leaf
+#   candidate    → circle (data.shape = "circle")
+#
+# Position nodes carry data.headcount / data.status / data.proficiency_level
+# so the leaf can show "Senior · 2 openings".
+# Candidate nodes carry data.match_score (0–100) and data.cv_id — the
+# candidate's full_name is in data.label for the circle caption.
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+# Positions are precomputed using a simple centered-parent tree layout
+# (y = depth × 160 px, siblings spaced 220 px). The frontend may re-layout
+# with dagre / elk — the ids, edges, and data stay identical.
+
+# ── Error: unauthenticated ────────────────────────────────────────────────────
+curl -s http://localhost:8080/api/v1/organization/structure | jq .
+# → 401 { "error": { "code": "MISSING_TOKEN", ... } }
