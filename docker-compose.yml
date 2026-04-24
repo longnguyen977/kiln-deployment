@@ -32,6 +32,9 @@ services:
       FRONTEND_URL:        ${FRONTEND_URL:?FRONTEND_URL missing — set in deploy/<env>.env}
       GOOGLE_REDIRECT_URL: ${GOOGLE_REDIRECT_URL:?GOOGLE_REDIRECT_URL missing — set in deploy/<env>.env}
       GMAIL_REDIRECT_URL:  ${GMAIL_REDIRECT_URL:?GMAIL_REDIRECT_URL missing — set in deploy/<env>.env}
+      # `?` (no colon) fails only on UNSET — empty string is a valid
+      # value for local dev (host-only cookie).
+      COOKIE_DOMAIN:       ${COOKIE_DOMAIN?COOKIE_DOMAIN missing — set in deploy/<env>.env (empty for dev, .kilnai.io for prod)}
     # Mount Google OAuth credentials from host so they aren't baked
     # into the image. File must exist at backend/credentials/google_oauth.json
     # on the host (chmod 600). The :ro flag makes it read-only in the container.
