@@ -336,8 +336,20 @@ touch schema.
 - `DATABASE_URL` / `GOOSE_DBSTRING` come from `env/.env.<env>`, the
   same file the backend container uses. **Single source of truth for
   DB connection**, no drift between app and migration configs.
-- The container talks to host-level Postgres via
-  `host.docker.internal` (wired by `--add-host host-gateway`).
+
+### Network mode (`--internal` vs `--external`)
+
+Two docker networking modes, pick the one that matches your DB string:
+
+| Flag | Docker network | When to use | DB string host |
+|---|---|---|---|
+| `--external` *(default)* | bridge + host.docker.internal wired | Postgres is on host **and** you're using `host.docker.internal` in the DB string, OR Postgres is elsewhere (RDS, remote VPS) | `host.docker.internal` or real DNS |
+| `--internal` | `--network host` | Postgres is on the **same host** and you want `localhost:5432` to work (Linux only) | `localhost` or `127.0.0.1` |
+
+If you see errors like `dial tcp 127.0.0.1:5432: connect: connection refused`,
+your DB string uses `localhost` but the default bridge mode is active.
+Either switch to `--internal` or change the DB string to
+`host.docker.internal`.
 
 ### Common commands
 
@@ -525,18 +537,21 @@ git submodule update --init --recursive
 ### `migration.sh` — schema changes
 
 ```
-./migration.sh up                 -e <env>     Apply all pending migrations
-./migration.sh up-by-one          -e <env>     Apply next single pending migration
-./migration.sh up-to   <version>  -e <env>     Apply up to specific version
-./migration.sh down               -e <env>     Roll back one migration
-./migration.sh down-to <version>  -e <env>     Roll back to specific version
-./migration.sh redo               -e <env>     Roll back + re-apply last
-./migration.sh reset              -e <env>     Roll back ALL  (confirmed, destructive)
-./migration.sh status             -e <env>     Show applied + pending
-./migration.sh version            -e <env>     Current schema version
-./migration.sh validate           -e <env>     Validate without applying
-./migration.sh create  <name>     -e <env>     New migration SQL file
-./migration.sh shell              -e <env>     Interactive shell (goose + psql)
-./migration.sh build                           Rebuild migration image
-./migration.sh help                            Show help
+./migration.sh up                 -e <env> [--internal|--external]
+./migration.sh up-by-one          -e <env> [--internal|--external]
+./migration.sh up-to   <version>  -e <env> [--internal|--external]
+./migration.sh down               -e <env> [--internal|--external]
+./migration.sh down-to <version>  -e <env> [--internal|--external]
+./migration.sh redo               -e <env> [--internal|--external]
+./migration.sh reset              -e <env> [--internal|--external]     (destructive)
+./migration.sh status             -e <env> [--internal|--external]
+./migration.sh version            -e <env> [--internal|--external]
+./migration.sh validate           -e <env> [--internal|--external]
+./migration.sh create  <name>     -e <env>
+./migration.sh shell              -e <env> [--internal|--external]
+./migration.sh build
+./migration.sh help
+
+--internal  : --network host       (use with DB string "localhost:5432")
+--external  : bridge + host-gateway (default; use "host.docker.internal")
 ```

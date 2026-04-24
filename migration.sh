@@ -15,7 +15,7 @@ readonly MIGRATIONS_DIR="backend/db/migrations"
 
 usage() {
     cat <<EOF
-Usage: ./migration.sh <command> -e <env> [args]
+Usage: ./migration.sh <command> -e <env> [--internal|--external] [args]
 
 Commands:
   up                       Apply all pending migrations
@@ -34,20 +34,33 @@ Commands:
   help                     Show this message
 
 Options:
-  -e | --env <dev|prod>    Target environment (required for all commands
-                           except 'build' and 'help')
+  -e | --env <dev|prod>    Target environment (required for most commands)
+  --internal               Use HOST network  (Postgres on same host as docker).
+                           DB string can use 'localhost:5432'. Linux only.
+  --external               Use BRIDGE network + host.docker.internal wiring
+                           (default). DB string must use 'host.docker.internal'
+                           for host-level Postgres, or a real DNS name for RDS.
 
 Examples:
-  ./migration.sh up       -e prod
-  ./migration.sh status   -e dev
-  ./migration.sh create   add_email_index -e dev
-  ./migration.sh up-to    20260501120000  -e prod
-  ./migration.sh shell    -e prod
+  # Postgres on the same EC2 host, DB string uses localhost:
+  ./migration.sh up      -e prod --internal
+
+  # Postgres on the same EC2 host, DB string uses host.docker.internal (default):
+  ./migration.sh up      -e prod
+
+  # Postgres on RDS or another server:
+  ./migration.sh up      -e prod --external
+
+  ./migration.sh create  add_email_index -e dev
+  ./migration.sh up-to   20260501120000  -e prod
+  ./migration.sh shell   -e prod --internal
 
 Notes:
   - Image is auto-built on first use.
   - 'reset' requires typing the env name to confirm.
   - 'create' writes to ${MIGRATIONS_DIR}/ on the host.
+  - --internal uses '--network host' which is Linux-only; on macOS/Windows
+    it silently falls back to bridge mode. Use --external on dev macs.
 EOF
 }
 
@@ -74,25 +87,41 @@ ensure_image() {
     docker image inspect "$IMAGE" >/dev/null 2>&1 || build_image
 }
 
-# Run goose inside the container.
+# Build the docker-run network flags based on $network_mode.
+# Populates a global array $NET_FLAGS.
+build_net_flags() {
+    if [[ "$network_mode" == "internal" ]]; then
+        # Host networking: container shares host's network stack;
+        # 'localhost' in the container reaches the host's Postgres directly.
+        NET_FLAGS=(--network host)
+    else
+        # Default bridge network; wire 'host.docker.internal' so DB strings
+        # targeting host-level Postgres keep working, and leave real DNS
+        # (RDS endpoints etc.) to resolve normally.
+        NET_FLAGS=(--add-host "host.docker.internal:host-gateway")
+    fi
+}
+
 run_goose() {
     local env=$1; shift
+    build_net_flags
     docker run --rm \
         --env-file "env/.env.${env}" \
         -e GOOSE_MIGRATION_DIR=/app/migrations \
         -v "$(pwd)/${MIGRATIONS_DIR}:/app/migrations" \
-        --add-host host.docker.internal:host-gateway \
+        "${NET_FLAGS[@]}" \
         "$IMAGE" "$@"
 }
 
 run_shell() {
     local env=$1
-    echo "==> entering migration shell (env=${env}) — 'goose' and 'psql' available"
+    build_net_flags
+    echo "==> entering migration shell (env=${env}, network=${network_mode}) — 'goose' and 'psql' available"
     docker run --rm -it \
         --env-file "env/.env.${env}" \
         -e GOOSE_MIGRATION_DIR=/app/migrations \
         -v "$(pwd)/${MIGRATIONS_DIR}:/app/migrations" \
-        --add-host host.docker.internal:host-gateway \
+        "${NET_FLAGS[@]}" \
         --entrypoint sh \
         "$IMAGE"
 }
@@ -111,13 +140,16 @@ confirm_destructive() {
 
 cmd=$1; shift
 env=""
+network_mode="external"
 args=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -e|--env)  env=${2:?}; shift 2 ;;
-        -h|--help) usage; exit 0 ;;
-        *)         args+=("$1"); shift ;;
+        -e|--env)   env=${2:?}; shift 2 ;;
+        --internal) network_mode="internal"; shift ;;
+        --external) network_mode="external"; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          args+=("$1"); shift ;;
     esac
 done
 
