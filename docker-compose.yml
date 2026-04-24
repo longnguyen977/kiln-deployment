@@ -4,7 +4,11 @@
 # Substitution vars come from deploy/<env>.env via `--env-file`:
 #   VERSION_BACKEND, VERSION_FRONTEND   image tags (e.g. 1.0.0-prod)
 #   BACKEND_ENV_FILE                    path to backend runtime env file
-#   API_URL                             frontend SSR -> backend URL
+#   BACKEND_URL                         frontend -> backend URL
+#                                       (public URL in prod — some Next.js
+#                                       route handlers do browser redirects
+#                                       to this value, so it must be reachable
+#                                       from the user's browser.)
 #
 # Postgres runs on the HOST; container reaches it via host.docker.internal.
 # Storage: S3 (no host volumes).
@@ -21,6 +25,11 @@ services:
       - "8080:8080"
     env_file:
       - ${BACKEND_ENV_FILE:?BACKEND_ENV_FILE missing — run deploy.sh}
+    # Mount Google OAuth credentials from host so they aren't baked
+    # into the image. File must exist at backend/credentials/google_oauth.json
+    # on the host (chmod 600). The :ro flag makes it read-only in the container.
+    volumes:
+      - ./backend/credentials:/app/credentials:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -42,7 +51,7 @@ services:
       NODE_ENV: production
       PORT: 3000
       HOSTNAME: 0.0.0.0
-      API_URL: ${API_URL:?API_URL missing — run deploy.sh}
+      BACKEND_URL: ${BACKEND_URL:?BACKEND_URL missing — run deploy.sh}
     networks:
       - kiln-network
     logging:

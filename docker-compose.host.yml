@@ -27,6 +27,11 @@ services:
     network_mode: host
     env_file:
       - ${BACKEND_ENV_FILE:?BACKEND_ENV_FILE missing — run deploy.sh}
+    # Mount Google OAuth credentials from host so they aren't baked
+    # into the image. File must exist at backend/credentials/google_oauth.json
+    # on the host (chmod 600). The :ro flag makes it read-only in the container.
+    volumes:
+      - ./backend/credentials:/app/credentials:ro
     # No healthcheck yet — add once backend exposes /healthz.
     logging:
       driver: json-file
@@ -43,7 +48,7 @@ services:
       NODE_ENV: production
       PORT: 3000
       HOSTNAME: 0.0.0.0
-      API_URL: ${API_URL:?API_URL missing — run deploy.sh}
+      BACKEND_URL: ${BACKEND_URL:?BACKEND_URL missing — run deploy.sh}
     logging:
       driver: json-file
       options:

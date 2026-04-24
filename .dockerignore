@@ -1,0 +1,46 @@
+# Keep the build context small and secret-free. The backend/frontend
+# dockerfiles use `COPY ./backend .` / `COPY ./frontend .` — whatever's
+# listed here won't be sent to the daemon, can't end up in an image
+# layer, and won't bust the build cache on unrelated changes.
+
+# ─── Never ship these into any image ─────────────────────────────────
+backend/credentials/
+backend/env/
+env/.env.dev
+env/.env.prod
+deploy/
+
+# ─── Version control ─────────────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+**/.git
+
+# ─── Build artifacts / local state ───────────────────────────────────
+# Frontend
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/.vercel
+
+# Backend
+backend/bin
+backend/api
+backend/tmp
+backend/coverage.*
+backend/*.out
+
+# ─── Huge local-only folders ─────────────────────────────────────────
+curl
+sql
+nginx.conf
+docker
+docker-compose*.yml
+deploy.sh
+migration.sh
+
+# ─── OS / editor cruft ───────────────────────────────────────────────
+**/.DS_Store
+**/.idea
+**/.vscode
+**/*.swp

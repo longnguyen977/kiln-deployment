@@ -178,7 +178,7 @@ cmd_status() {
     echo "    VERSION_BACKEND  = $(get_state "$env" VERSION_BACKEND)"
     echo "    VERSION_FRONTEND = $(get_state "$env" VERSION_FRONTEND)"
     echo "    NETWORK_MODE     = ${mode}  (compose file: $(compose_file_for "$env"))"
-    echo "    API_URL          = $(get_state "$env" API_URL)"
+    echo "    BACKEND_URL      = $(get_state "$env" BACKEND_URL)"
     echo "==> running containers"
     compose "$env" ps
 }

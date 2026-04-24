@@ -59,7 +59,7 @@ in `deploy/<env>.env`.
 - **Backend** (`kiln-backend-service`): Go + Fiber, port `8080`, connects
   to host-level Postgres via `host.docker.internal`, uploads CVs to S3.
 - **Frontend** (`kiln-frontend-service`): Next.js 16, port `3000`,
-  SSR calls backend via `${API_URL}`; browser-side uses
+  SSR calls backend via `${BACKEND_URL}`; browser-side uses
   `NEXT_PUBLIC_*` vars baked in at build time.
 - **Postgres**: runs on the host (not in docker). Backups via AWS Backup
   + nightly `pg_dump` to S3.
@@ -82,7 +82,7 @@ kiln-deployment/                  ← this repo
 │   ├── frontend.dockerfile       ← multi-stage Next.js build
 │   └── migration.dockerfile      ← goose + psql, ~15 MB
 ├── deploy/
-│   ├── dev.env                   ← state: VERSION_*, API_URL, paths (committed)
+│   ├── dev.env                   ← state: VERSION_*, BACKEND_URL, paths (committed)
 │   └── prod.env
 ├── env/
 │   ├── .env.dev.example          ← copy → .env.dev, fill secrets (gitignored)
@@ -155,18 +155,49 @@ chmod 600 env/.env.prod
 $EDITOR env/.env.prod
 ```
 
-Google OAuth JSON goes in the backend submodule:
+### Deploy Google OAuth credentials
+
+The JSON gets **bind-mounted** into the backend container — never copied
+into the image. So it stays on disk only, rotations don't require a
+rebuild, and the image is safe to share.
+
+From your laptop:
 
 ```bash
-mkdir -p backend/credentials
-$EDITOR backend/credentials/google_oauth.json     # paste your OAuth client JSON
-chmod 600 backend/credentials/google_oauth.json
+# Use scp — NOT ftp. FTP is plaintext; scp uses your SSH key.
+scp -i ~/.ssh/kiln.pem google_oauth.json \
+    ubuntu@<ec2-ip>:/home/ubuntu/kiln-deployment/backend/credentials/google_oauth.json
+
+# On the EC2, lock down permissions
+ssh ubuntu@<ec2-ip> \
+  "chmod 600 ~/kiln-deployment/backend/credentials/google_oauth.json && \
+   ls -l ~/kiln-deployment/backend/credentials/"
 ```
+
+docker-compose mounts `./backend/credentials` as read-only at
+`/app/credentials` inside the container. The backend reads
+`GOOGLE_CRED_FILE=credentials/google_oauth.json` (see `env/.env.prod`)
+— the relative path resolves to the mounted file. Rotating the key
+is: `scp new-key → old-backend container restart` (no rebuild).
+
+### Future: migrate secrets off disk
+
+For tighter ops, replace the file-on-disk with one of:
+
+| Option | Cost | Effort | Good for |
+|---|---|---|---|
+| **AWS Parameter Store (SecureString)** | free tier ≥ enough | small Go change | single prod env |
+| **AWS Secrets Manager** | ~$0.40 per secret/mo | small Go change | rotations, audit |
+| **sops / age** encrypted file in repo | free | medium | GitOps-style |
+
+All three let you remove `backend/credentials/` from the EC2 entirely
+— the backend fetches at startup. Worth doing once you have more
+than one deploy surface.
 
 ### 3. Edit server-facing values
 
 ```bash
-$EDITOR deploy/prod.env                # set SERVER_IP + API_URL
+$EDITOR deploy/prod.env                # set SERVER_IP + BACKEND_URL
 $EDITOR frontend/.env.local            # set NEXT_PUBLIC_* vars, rebuild after
 ```
 
@@ -291,11 +322,11 @@ VERSION_BACKEND=1.0.1-prod
 VERSION_FRONTEND=1.0.1-prod
 BACKEND_ENV_FILE=./env/.env.prod
 SERVER_IP=1.2.3.4
-API_URL=http://1.2.3.4:8080
+BACKEND_URL=http://1.2.3.4:8080
 ```
 
 `deploy.sh` updates the `VERSION_*` lines on every deploy. Edit
-`SERVER_IP` and `API_URL` by hand when the server moves.
+`SERVER_IP` and `BACKEND_URL` by hand when the server moves.
 
 ### Logs & log rotation
 
