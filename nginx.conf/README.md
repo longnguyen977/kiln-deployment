@@ -9,13 +9,22 @@ nginx.conf/
 ├── nginx.conf                   # main: events, http, includes
 ├── conf.d/
 │   ├── upstreams.conf           # kiln_backend + kiln_frontend pools
-│   └── kiln.conf                # server block + routing
+│   └── kiln.conf                # server block — listen/server_name + includes
 └── snippets/
+    ├── kiln-backend.conf        # /api/* locations (backend team owns)
+    ├── kiln-frontend.conf       # / + /_next/* locations (frontend team owns)
     ├── proxy-common.conf        # shared X-Forwarded-* headers + timeouts
     ├── security-headers.conf    # XFO, nosniff, referrer-policy, HSTS (commented)
     ├── cloudflare-real-ip.conf  # trust CF edges, restore real client IP
     └── tls-example.conf         # reference :443 block for Cloudflare / certbot
 ```
+
+**Why the routing is split across two snippets:** `location{}` blocks
+must live inside a `server{}`. Dropping two separate `kiln-*.conf`
+files into `conf.d/` would parse them at `http{}` context and error.
+Keeping them in `snippets/` and explicitly `include`-ing both from
+`conf.d/kiln.conf` lets each team own its routing file independently
+without touching the other's.
 
 ## What it does
 
