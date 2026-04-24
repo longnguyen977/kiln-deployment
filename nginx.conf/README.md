@@ -1,68 +1,99 @@
 # nginx.conf/
 
-Nginx reverse-proxy config for the Kiln ATS EC2 host.
+Nginx reverse-proxy config for the Kiln ATS EC2 host. Subdomain-split:
+`api.kilnai.io` → Go backend, `app.kilnai.io` → Next.js, everything else
+is silently dropped.
 
 ## Layout
 
 ```
 nginx.conf/
-├── nginx.conf                   # main: events, http, includes
+├── nginx.conf                       # main: events, http, includes, trusts CF IPs
 ├── conf.d/
-│   ├── upstreams.conf           # kiln_backend + kiln_frontend pools
-│   └── kiln.conf                # server block — listen/server_name + includes
+│   ├── upstreams.conf               # kiln_backend + kiln_frontend pools
+│   ├── api.kilnai.io.conf           # api subdomain → backend (public API entry)
+│   ├── app.kilnai.io.conf           # app subdomain → Next.js
+│   └── default-reject.conf          # catch-all (Host != api/app) → 444
 └── snippets/
-    ├── kiln-backend.conf        # /api/* locations (backend team owns)
-    ├── kiln-frontend.conf       # / + /_next/* locations (frontend team owns)
-    ├── proxy-common.conf        # shared X-Forwarded-* headers + timeouts
-    ├── security-headers.conf    # XFO, nosniff, referrer-policy, HSTS (commented)
-    ├── cloudflare-real-ip.conf  # trust CF edges, restore real client IP
-    └── tls-example.conf         # reference :443 block for Cloudflare / certbot
+    ├── kiln-backend.conf            # routes for api.* (backend team owns)
+    ├── kiln-frontend.conf           # routes for app.* (frontend team owns)
+    ├── proxy-common.conf            # shared X-Forwarded-* headers + timeouts
+    ├── security-headers.conf        # XFO, nosniff, referrer-policy
+    ├── cloudflare-real-ip.conf      # trust CF edges, restore real client IP
+    └── tls-example.conf             # reference :443 block for CF origin cert / certbot
 ```
 
-**Why the routing is split across two snippets:** `location{}` blocks
-must live inside a `server{}`. Dropping two separate `kiln-*.conf`
-files into `conf.d/` would parse them at `http{}` context and error.
-Keeping them in `snippets/` and explicitly `include`-ing both from
-`conf.d/kiln.conf` lets each team own its routing file independently
-without touching the other's.
+**Why routing is split across snippets:** `location{}` must live inside
+`server{}`, and files auto-included from `conf.d/` are parsed at `http{}`
+context. Putting route rules in `snippets/` and including them from each
+per-subdomain server block lets each team own its routing independently.
 
-## What it does
+## Architecture
 
-- **Multi-worker** (`worker_processes auto`) + **epoll** event model + `multi_accept on` — Linux high-throughput basics.
-- **Two upstream pools** (`kiln_backend` :8080, `kiln_frontend` :3000) with `least_conn` load balancing and keepalive connection pools — ready to scale by adding `server` lines.
-- **Routes**:
-  - `/api/*` → backend
-  - `/_next/static/*` → frontend with 1-year immutable cache
-  - `/_next/image` → frontend with 1-day cache
-  - everything else → frontend (Next.js SSR)
-- **Healthcheck** at `/nginx-health` for external monitors.
-- **Gzip**, 25 MB upload limit (CVs / PDFs), reasonable timeouts.
+```
+            https://app.kilnai.io                https://api.kilnai.io
+                    │                                       │
+                    ▼                                       ▼
+            ┌──────────────────┐                    ┌──────────────────┐
+            │   Cloudflare     │ ◄── TLS terminates ┤   Cloudflare     │
+            │   (Flexible)     │                    │   (Flexible)     │
+            └────────┬─────────┘                    └────────┬─────────┘
+                     │ HTTP :80                              │ HTTP :80
+                     ▼                                       ▼
+            ┌──────────────────────────────────────────────────────┐
+            │            EC2 — nginx (ports 80/443)                │
+            │   SG allows :80/:443 from Cloudflare IPv4 only       │
+            └────────┬─────────────────────────────────┬───────────┘
+                     │                                 │
+                     │ server_name = app.kilnai.io     │ server_name = api.kilnai.io
+                     ▼                                 ▼
+            ┌──────────────────┐              ┌──────────────────┐
+            │  Next.js :3000   │──── /api ───▶│  Go + Fiber :8080│
+            │  (SSR + proxy)   │  127.0.0.1   │                  │
+            └──────────────────┘              └──────────────────┘
+```
+
+Browser requests for `/api/*` hit the **Next.js** process on `app.*`,
+which proxies server-side to the Go backend on `127.0.0.1:8080`. Real
+backend endpoints are never exposed to the browser via this subdomain.
+
+`api.kilnai.io` is the public entry for non-browser clients:
+OAuth callbacks, Chrome extension, webhooks, future mobile apps.
+
+Anything else (`kilnai.io`, `www.kilnai.io`, random subdomain scans,
+direct-IP probes) → `444` close connection, logged under `rejected.access.log`.
+
+## What's enabled
+
+- **Multi-worker** (`worker_processes auto`) + **epoll** + `multi_accept on`
+- **Upstream pools** with `least_conn` + keepalive (32 idle conns/worker)
+- **Cloudflare real-IP restore** via `CF-Connecting-IP` (at `http{}` level)
+- **Per-subdomain access logs** (`api.kilnai.io.access.log`, `app.kilnai.io.access.log`, `rejected.access.log`)
+- **Gzip**, 25 MB upload cap (CV / PDF), sensible timeouts
+- **Next.js cache headers**: `/_next/static/*` → 1 y immutable, `/_next/image` → 1 d
+- **Health** at `/nginx-health` on each subdomain for CF health checks
 
 ## Deploying to the EC2
 
 ### First install
 
 ```bash
-# One-time: install nginx
-sudo apt update && sudo apt install -y nginx       # Ubuntu
+sudo apt update && sudo apt install -y nginx         # Ubuntu
 # OR
-sudo dnf install -y nginx                          # AL2023
+sudo dnf install -y nginx                            # AL2023
 
-# Back up the distro defaults so you can always revert
-sudo mv /etc/nginx/nginx.conf        /etc/nginx/nginx.conf.orig
-sudo mv /etc/nginx/conf.d            /etc/nginx/conf.d.orig 2>/dev/null || true
-sudo mv /etc/nginx/snippets          /etc/nginx/snippets.orig 2>/dev/null || true
+# Back up distro defaults
+sudo mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.orig
+sudo mv /etc/nginx/conf.d     /etc/nginx/conf.d.orig     2>/dev/null || true
+sudo mv /etc/nginx/snippets   /etc/nginx/snippets.orig   2>/dev/null || true
 
-# Symlink this repo's configs into place (so `git pull` == config update)
-REPO=/home/ubuntu/kiln-deployment        # adjust for your path
-sudo ln -sf "$REPO/nginx.conf/nginx.conf"       /etc/nginx/nginx.conf
-sudo ln -sf "$REPO/nginx.conf/conf.d"           /etc/nginx/conf.d
-sudo ln -sf "$REPO/nginx.conf/snippets"         /etc/nginx/snippets
+# Symlink this repo into place
+REPO=/home/ubuntu/kiln-deployment
+sudo ln -sf "$REPO/nginx.conf/nginx.conf" /etc/nginx/nginx.conf
+sudo ln -sf "$REPO/nginx.conf/conf.d"     /etc/nginx/conf.d
+sudo ln -sf "$REPO/nginx.conf/snippets"   /etc/nginx/snippets
 
-# Validate before reloading — -t catches syntax errors
 sudo nginx -t
-
-# Apply
 sudo systemctl enable --now nginx
 sudo systemctl reload nginx
 ```
@@ -75,45 +106,58 @@ git pull
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-`reload` does a zero-downtime swap: old workers finish in-flight requests, new workers pick up new config. If `nginx -t` fails, **don't reload** — fix the error first.
+`reload` does a zero-downtime swap. If `nginx -t` fails, **don't reload** —
+fix the error first.
+
+## Cloudflare DNS setup
+
+Both subdomains must be proxied (orange cloud):
+
+| Type | Name | Content           | Proxy |
+|------|------|-------------------|-------|
+| A    | api  | 13.213.59.10      | ✅    |
+| A    | app  | 13.213.59.10      | ✅    |
+
+Cloudflare SSL/TLS setting: **Flexible** (user → CF via HTTPS,
+CF → origin via HTTP). Upgrade to **Full (strict)** + a CF-issued
+**Origin Certificate** later for end-to-end encryption without
+managing Let's Encrypt.
 
 ## Typical tweaks
 
+### Adding a subdomain
+
+Copy `conf.d/api.kilnai.io.conf`, change `server_name`, change the
+`include` target, reload.
+
 ### Scaling backend horizontally
 
-Open `conf.d/upstreams.conf`, uncomment the commented `server` lines, point them at extra backend instances (e.g. `127.0.0.1:8081`, `:8082`). Run another backend container on each port via `deploy.sh`, reload nginx.
+Open `conf.d/upstreams.conf`, uncomment the commented `server` lines.
+Run additional backend containers on :8081, :8082, etc. via
+`deploy.sh`. `least_conn` load-balances automatically.
 
-### Adding a domain
+### Pointing the catch-all to a landing page
 
-Edit `conf.d/kiln.conf`, replace `server_name _;` with your domain:
+In `conf.d/default-reject.conf`, swap:
 
 ```nginx
-server_name kiln.example.com;
+return 444;
 ```
 
-Reload.
+for
 
-### Enabling HTTPS
-
-Two paths — pick one:
-
-1. **Cloudflare in front** (recommended for first deploy). Point DNS at the EC2 in proxied mode ("orange cloud"). CF terminates TLS. Origin keeps plain HTTP. Include `snippets/cloudflare-real-ip.conf` in your server block so logs show real client IPs, not CF edges.
-
-2. **Certbot direct on origin**. `sudo certbot --nginx -d kiln.example.com`. Certbot will add a :443 server block automatically; use `snippets/tls-example.conf` as a reference for the hand-tuned version.
-
-### Noisy upstream errors
-
-If you see `upstream prematurely closed connection` in logs, bump keepalive settings in `conf.d/upstreams.conf` — the `keepalive_timeout 60s` is aligned with Fiber's default so they shouldn't fight, but fiddle if needed.
+```nginx
+return 301 https://kilnai.io$request_uri;
+```
 
 ## Performance notes
 
-- `worker_processes auto` = one worker per vCPU. On `t3.xlarge` (4 vCPU) you get 4 workers × 4096 connections = **16 384 concurrent connections** cap. Plenty for 100 users.
-- `sendfile on` + `tcp_nopush on` + `tcp_nodelay on` = standard kernel-level zero-copy + low-latency combo.
-- `keepalive` to upstream (32 idle connections per worker) avoids a TCP handshake on every API call; big win when the browser fires 10–20 parallel requests on a page load.
-- Next.js static assets are hashed (`/_next/static/<hash>/...`) — the 1-year `immutable` cache on those is safe and dramatic for returning-visitor page speed.
+- `worker_processes auto` = 4 workers on `t3.xlarge` × 4096 conns = **16 384 concurrent connections** headroom.
+- `keepalive` to upstream avoids a TCP handshake on every API call.
+- Next.js hashed assets get 1-year `immutable` cache — dramatic page-speed win for returning visitors.
 
 ## What's NOT in here (by design)
 
-- **Rate limiting** (`limit_req_zone`) — add when you start seeing abuse. Right now the ATS has known users, not public abuse risk.
-- **WAF rules** — if needed, let Cloudflare handle it at the edge.
-- **Metrics export** (`stub_status` or `vts`) — add when you care about nginx-level metrics. For now, access logs + `upstream_response_time` in the log format give enough.
+- **Rate limiting** — add when abuse shows up. Cloudflare can cover this at the edge.
+- **WAF** — Cloudflare's WAF is the right layer.
+- **TLS on origin** — Cloudflare Flexible is simpler for now. See `snippets/tls-example.conf` for the upgrade path.
