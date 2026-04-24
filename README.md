@@ -75,7 +75,8 @@ in `deploy/<env>.env`.
 kiln-deployment/                  ← this repo
 ├── deploy.sh                     ← deploy tool (build / deploy / rollback)
 ├── migration.sh                  ← goose migration runner (schema changes)
-├── docker-compose.yml            ← real compose, uses ${VAR} substitution
+├── docker-compose.yml            ← bridge-network compose (--external, default)
+├── docker-compose.host.yml       ← host-network compose  (--internal)
 ├── docker/
 │   ├── backend.dockerfile        ← multi-stage Go build
 │   ├── frontend.dockerfile       ← multi-stage Next.js build
@@ -433,6 +434,32 @@ accidental pruning) without meaningful benefit. Host-level Postgres is
 easier to back up, tune, and move to RDS later. The docker services
 reach it via `host.docker.internal` + `extra_hosts: host-gateway`.
 
+### Network mode: `--internal` vs `--external`
+
+Both `deploy.sh` and `migration.sh` accept `--internal` / `--external`
+flags that control how docker containers reach host-level Postgres.
+They resolve to **two different compose files** (because
+`network_mode: host` can't be cleanly toggled via override):
+
+| Mode | Compose file | Docker network | Use when | DB string host |
+|---|---|---|---|---|
+| `--external` *(default)* | `docker-compose.yml` | bridge + `host.docker.internal` wired | Postgres is reached via `host.docker.internal`, OR Postgres is elsewhere (RDS, remote) | `host.docker.internal` / real DNS |
+| `--internal` | `docker-compose.host.yml` | `network_mode: host` | Postgres is on the **same host** and DB string uses `localhost` | `localhost` / `127.0.0.1` |
+
+`deploy.sh` persists the choice in `deploy/<env>.env` as
+`NETWORK_MODE=…` — pass the flag once, every subsequent command (and
+reboots) honor it. `migration.sh` doesn't persist; pass the flag each
+time (or match whatever `deploy.sh` is using).
+
+**Symptom that tells you the mode is wrong:** you see
+`dial tcp 127.0.0.1:5432: connect: connection refused` in the backend
+logs. Either flip to `--internal` or change the DB string in
+`env/.env.<env>` to use `host.docker.internal`.
+
+Host network mode is **Linux-only** and the right choice for the EC2
+production host. On macOS Docker Desktop it silently falls back to
+bridge mode, so local dev should stick with `--external`.
+
 ### Why frontend env is baked in at build time
 
 Next.js inlines `NEXT_PUBLIC_*` env vars into the client bundle during
@@ -524,14 +551,19 @@ git submodule update --init --recursive
 ### `deploy.sh` — build + ship app code
 
 ```
-./deploy.sh up        -e <env> -v <version>    Build + deploy both services
-./deploy.sh backend   -e <env> -v <version>    Build + deploy backend only
-./deploy.sh frontend  -e <env> -v <version>    Build + deploy frontend only
-./deploy.sh rollback  -e <env> -v <version>    Re-tag to existing images (no build)
-./deploy.sh down      -e <env>                 Stop & remove both services
-./deploy.sh status    -e <env>                 Show running versions + ps
-./deploy.sh logs      -e <env> [service]       Tail logs (backend|frontend|all)
-./deploy.sh help                               Show help
+./deploy.sh up        -e <env> -v <version> [--internal|--external]
+./deploy.sh backend   -e <env> -v <version>
+./deploy.sh frontend  -e <env> -v <version>
+./deploy.sh rollback  -e <env> -v <version>
+./deploy.sh down      -e <env>
+./deploy.sh status    -e <env>                 (shows NETWORK_MODE too)
+./deploy.sh logs      -e <env> [service]
+./deploy.sh help
+
+--internal / --external flip the compose file used for this env
+(docker-compose.yml vs docker-compose.host.yml) and are STICKY —
+persisted to deploy/<env>.env as NETWORK_MODE so reboots use the
+same mode without you having to pass the flag again.
 ```
 
 ### `migration.sh` — schema changes

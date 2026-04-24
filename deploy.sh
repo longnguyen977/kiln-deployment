@@ -10,6 +10,9 @@ readonly FRONTEND_SERVICE="kiln-frontend-service"
 readonly BACKEND_IMAGE="kiln-backend"
 readonly FRONTEND_IMAGE="kiln-frontend"
 
+readonly COMPOSE_EXTERNAL="docker-compose.yml"       # bridge network + host.docker.internal
+readonly COMPOSE_INTERNAL="docker-compose.host.yml"  # host network mode
+
 usage() {
     cat <<EOF
 Usage: ./deploy.sh <command> [options]
@@ -27,16 +30,23 @@ Commands:
 Options:
   -e | --env <dev|prod>    Target environment (required for most commands)
   -v | --version <x.y.z>   Semver without suffix (e.g. 1.0.0); env is appended
+  --internal               Use HOST network mode (Postgres on same host;
+                           DB strings use 'localhost'). Linux only.
+                           Persisted to deploy/<env>.env.
+  --external               Use bridge network + host.docker.internal (default).
+                           Persisted to deploy/<env>.env.
   -h | --help              Show this message
 
 Examples:
-  ./deploy.sh up       -e prod -v 1.0.0
+  ./deploy.sh up       -e prod -v 1.0.0 --internal
   ./deploy.sh backend  -e prod -v 1.0.1
   ./deploy.sh rollback -e prod -v 1.0.0
   ./deploy.sh logs     -e prod backend
 
 Notes:
-  - First-time migrations are manual against the external Postgres.
+  - First-time migrations are run via ./migration.sh — see README.
+  - Network mode is sticky: set it once with --internal/--external and
+    all subsequent commands (including reboots) use the same file.
   - Edit deploy/<env>.env for SERVER_IP / API_URL; secrets live in env/.env.<env>.
 EOF
 }
@@ -55,26 +65,44 @@ check_env() {
     [[ -f "env/.env.${env}" ]]    || die "env/.env.${env} not found (copy env/.env.${env}.example)"
 }
 
-compose() {
-    local env=$1; shift
-    docker compose --env-file "deploy/${env}.env" "$@"
-}
-
-# Rewrite a single KEY=VALUE line in deploy/<env>.env in-place.
+# Rewrite (or append) a single KEY=VALUE line in deploy/<env>.env in-place.
 set_state() {
     local env=$1 key=$2 val=$3
     local file="deploy/${env}.env"
-    # portable sed -i (mac + linux)
-    if sed --version >/dev/null 2>&1; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+    if grep -qE "^${key}=" "$file"; then
+        if sed --version >/dev/null 2>&1; then
+            sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+        else
+            sed -i '' "s|^${key}=.*|${key}=${val}|" "$file"
+        fi
     else
-        sed -i '' "s|^${key}=.*|${key}=${val}|" "$file"
+        printf '\n%s=%s\n' "$key" "$val" >> "$file"
     fi
 }
 
 get_state() {
     local env=$1 key=$2
-    grep -E "^${key}=" "deploy/${env}.env" | cut -d= -f2-
+    grep -E "^${key}=" "deploy/${env}.env" 2>/dev/null | cut -d= -f2- || true
+}
+
+# Return the compose file matching the env's persisted NETWORK_MODE.
+compose_file_for() {
+    local env=$1
+    local mode
+    mode=$(get_state "$env" NETWORK_MODE)
+    mode=${mode:-external}                        # backward-compat default
+    if [[ "$mode" == "internal" ]]; then
+        echo "$COMPOSE_INTERNAL"
+    else
+        echo "$COMPOSE_EXTERNAL"
+    fi
+}
+
+compose() {
+    local env=$1; shift
+    local file
+    file=$(compose_file_for "$env")
+    docker compose --env-file "deploy/${env}.env" -f "$file" "$@"
 }
 
 build_backend() {
@@ -144,9 +172,12 @@ cmd_down() {
 
 cmd_status() {
     local env=$1
+    local mode
+    mode=$(get_state "$env" NETWORK_MODE); mode=${mode:-external}
     echo "==> ${env} state (deploy/${env}.env)"
     echo "    VERSION_BACKEND  = $(get_state "$env" VERSION_BACKEND)"
     echo "    VERSION_FRONTEND = $(get_state "$env" VERSION_FRONTEND)"
+    echo "    NETWORK_MODE     = ${mode}  (compose file: $(compose_file_for "$env"))"
     echo "    API_URL          = $(get_state "$env" API_URL)"
     echo "==> running containers"
     compose "$env" ps
@@ -168,12 +199,15 @@ cmd_logs() {
 cmd=$1; shift
 env=""
 version=""
+network_mode=""
 extra=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -e|--env)     env=${2:?}; shift 2 ;;
         -v|--version) version=${2:?}; shift 2 ;;
+        --internal)   network_mode="internal"; shift ;;
+        --external)   network_mode="external"; shift ;;
         -h|--help)    usage; exit 0 ;;
         *)            extra+=("$1"); shift ;;
     esac
@@ -186,6 +220,13 @@ esac
 check_docker
 [[ -n "$env" ]] || die "missing -e <dev|prod>"
 check_env "$env"
+
+# Persist network mode if the flag was passed. Sticky: applies to all
+# subsequent commands until overridden.
+if [[ -n "$network_mode" ]]; then
+    set_state "$env" NETWORK_MODE "$network_mode"
+    echo "==> NETWORK_MODE set to '$network_mode' (persisted to deploy/${env}.env)"
+fi
 
 needs_version() {
     [[ -n "$version" ]] || die "missing -v <version> for '$cmd'"

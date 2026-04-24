@@ -1,0 +1,51 @@
+# ──────────────────────────────────────────────────────────────────────
+# Kiln ATS — HOST-NETWORK variant.
+#
+# Used when --internal is selected on deploy.sh. Both services join the
+# host's network stack (network_mode: host), so:
+#
+#   - localhost:5432 inside the container reaches the host's Postgres
+#   - the backend listens directly on host port 8080 (no port mapping)
+#   - the frontend listens directly on host port 3000
+#   - the frontend reaches the backend at http://127.0.0.1:8080
+#
+# Trade-offs vs docker-compose.yml (bridge mode):
+#   + No host.docker.internal gymnastics for DB
+#   + Lower latency (no docker-proxy hop for inbound traffic)
+#   - Linux only; Docker Desktop on mac only half-supports it
+#   - No container DNS: services can't reach each other by name
+#   - ports/extra_hosts/networks are all ignored
+#
+# Managed by deploy.sh — don't edit service versions by hand.
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+  kiln-backend-service:
+    image: kiln-backend:${VERSION_BACKEND:?VERSION_BACKEND missing — run deploy.sh}
+    container_name: kiln-backend-service
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ${BACKEND_ENV_FILE:?BACKEND_ENV_FILE missing — run deploy.sh}
+    # No healthcheck yet — add once backend exposes /healthz.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  kiln-frontend-service:
+    image: kiln-frontend:${VERSION_FRONTEND:?VERSION_FRONTEND missing — run deploy.sh}
+    container_name: kiln-frontend-service
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      API_URL: ${API_URL:?API_URL missing — run deploy.sh}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
