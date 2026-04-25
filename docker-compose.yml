@@ -35,6 +35,7 @@ services:
       # `?` (no colon) fails only on UNSET — empty string is a valid
       # value for local dev (host-only cookie).
       COOKIE_DOMAIN:       ${COOKIE_DOMAIN?COOKIE_DOMAIN missing — set in deploy/<env>.env (empty for dev, .kilnai.io for prod)}
+      EXTENSION_S3_KEY:    ${EXTENSION_S3_KEY:?EXTENSION_S3_KEY missing — set in deploy/<env>.env}
     # Mount Google OAuth credentials from host so they aren't baked
     # into the image. File must exist at backend/credentials/google_oauth.json
     # on the host (chmod 600). The :ro flag makes it read-only in the container.

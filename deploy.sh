@@ -183,6 +183,7 @@ cmd_status() {
     echo "    GOOGLE_REDIRECT_URL = $(get_state "$env" GOOGLE_REDIRECT_URL)"
     echo "    GMAIL_REDIRECT_URL  = $(get_state "$env" GMAIL_REDIRECT_URL)"
     echo "    COOKIE_DOMAIN       = $(get_state "$env" COOKIE_DOMAIN)"
+    echo "    EXTENSION_S3_KEY    = $(get_state "$env" EXTENSION_S3_KEY)"
     echo "==> running containers"
     compose "$env" ps
 }
